@@ -453,6 +453,18 @@ int extract_zip(const options_t* opts) {
     init_progress(&ctx.progress);
     ctx.progress.total_files = zip_get_num_entries(archive, 0);
     
+    // Security check: limit number of files
+    if (ctx.progress.total_files > MAX_EXTRACT_FILES) {
+        fprintf(stderr, "Security warning: Archive contains %zu files (limit: %d)\n", 
+                ctx.progress.total_files, MAX_EXTRACT_FILES);
+        fprintf(stderr, "This may be a ZIP bomb or extremely large archive. Use with caution.\n");
+        if (!opts->force) {
+            fprintf(stderr, "Extraction cancelled. Use -f to force extraction.\n");
+            zip_close(archive);
+            return EXIT_FILE_ERROR;
+        }
+    }
+    
     if (ctx.verbose) {
         printf("Extracting ZIP archive '%s' to '%s'\n", opts->zip_file, opts->target_dir);
         printf("Total entries: %zu\n", ctx.progress.total_files);
@@ -460,7 +472,45 @@ int extract_zip(const options_t* opts) {
     
     // Extract all entries
     int result = EXIT_SUCCESS;
+    size_t total_extracted_size = 0;
+    size_t suspicious_files = 0;
+    
     for (zip_uint64_t i = 0; i < ctx.progress.total_files; i++) {
+        // Get file stats for security checks
+        zip_stat_t stat;
+        if (zip_stat_index(archive, i, 0, &stat) == 0) {
+            total_extracted_size += stat.size;
+            
+            // Check for suspicious files
+            if (is_suspicious_file(stat.name)) {
+                suspicious_files++;
+                if (ctx.verbose) {
+                    printf("Warning: Potentially dangerous file: %s\n", stat.name);
+                }
+            }
+            
+            // Check compression ratio for potential zip bombs (only warn on extremely high ratios)
+            if (stat.comp_size > 0 && stat.size > 0) {
+                double compression_ratio = (double)stat.size / (double)stat.comp_size;
+                if (compression_ratio > MAX_COMPRESSION_RATIO && stat.size > 1024 * 1024) {
+                    printf("Warning: Very high compression ratio (%.1f:1) for large file: %s\n", 
+                           compression_ratio, stat.name);
+                }
+            }
+            
+            // Check total extracted size limit
+            if (total_extracted_size > MAX_EXTRACT_SIZE) {
+                fprintf(stderr, "Security warning: Total extracted size would exceed %llu bytes (%.1f GB)\n", 
+                        (unsigned long long)MAX_EXTRACT_SIZE, 
+                        (double)MAX_EXTRACT_SIZE / (1024.0 * 1024.0 * 1024.0));
+                if (!opts->force) {
+                    fprintf(stderr, "Extraction cancelled. Use -f to force extraction.\n");
+                    result = EXIT_FILE_ERROR;
+                    break;
+                }
+            }
+        }
+        
         result = extract_file_from_zip(&ctx, i, opts->target_dir);
         if (result != EXIT_SUCCESS) {
             break;
@@ -470,6 +520,11 @@ int extract_zip(const options_t* opts) {
         if (ctx.verbose) {
             print_progress(&ctx.progress, "Extracting");
         }
+    }
+    
+    if (suspicious_files > 0) {
+        printf("Warning: Extracted %zu potentially dangerous files. Review before executing.\n", 
+               suspicious_files);
     }
     
     zip_close(archive);
@@ -589,6 +644,12 @@ int extract_file_from_zip(zip_context_t* ctx, zip_uint64_t index, const char* ou
         fprintf(stderr, "Error getting file stats at index %lld: %s\n", 
                 (long long)index, zip_strerror(ctx->archive));
         return EXIT_ZIP_ERROR;
+    }
+    
+    // Security check: validate path safety
+    if (!is_safe_path(stat.name)) {
+        fprintf(stderr, "Security warning: Unsafe path detected '%s' - skipping extraction\n", stat.name);
+        return EXIT_SUCCESS; // Skip this file but continue
     }
     
     // Build output path
