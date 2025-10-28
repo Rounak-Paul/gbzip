@@ -6,7 +6,8 @@
 #include "logging.h"
 
 void print_usage(const char* program_name) {
-    printf("gbzip - ZIP utility with gitignore-style patterns\n\n");
+    printf("gbzip - ZIP utility with gitignore-style patterns\n");
+    printf("*** PROVIDED \"AS IS\" - USE AT YOUR OWN RISK ***\n\n");
     printf("Usage: %s [-options] zipfile [file...]\n\n", program_name);
     printf("Options:\n");
     printf("  -r   recurse into directories (default)     -j   junk (don't record) directory names\n");
@@ -29,6 +30,11 @@ void print_usage(const char* program_name) {
     printf("  %s -l archive.zip               List contents of archive\n", program_name);
     printf("  %s -D archive.zip project/      Update archive with changes in project\n", program_name);
     printf("  %s -Z                           Create default .zipignore file\n", program_name);
+    printf("\nSecurity Notes:\n");
+    printf("  - Only extract archives from trusted sources\n");
+    printf("  - Use -f to force extraction of very large archives (>50GB or >100k files)\n");
+    printf("  - Review extracted files before executing, especially .exe, .bat, .sh files\n");
+    printf("  - Extraction includes basic protections against path traversal attacks\n");
 }
 
 void print_version(void) {

@@ -43,6 +43,11 @@
 #define ZIPIGNORE_FILENAME ".zipignore"
 #define DEFAULT_ZIPIGNORE_PATH "~/.zipignore"
 
+// Security limits - reasonable values for legitimate use while protecting against obvious attacks
+#define MAX_EXTRACT_SIZE (50ULL * 1024ULL * 1024ULL * 1024ULL)  // 50GB limit
+#define MAX_EXTRACT_FILES 100000  // Maximum number of files to extract (100k files)
+#define MAX_COMPRESSION_RATIO 1000  // Maximum compression ratio warning threshold
+
 // Exit codes
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1

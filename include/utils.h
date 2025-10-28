@@ -19,6 +19,10 @@ char* join_path(const char* dir, const char* file);
 const char* get_filename(const char* path);
 const char* get_file_extension(const char* path);
 
+// Security utilities
+bool is_safe_path(const char* path);
+bool is_suspicious_file(const char* filename);
+
 // Directory traversal
 typedef struct {
     char path[PATH_MAX];

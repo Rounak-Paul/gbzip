@@ -1,6 +1,10 @@
 #include "utils.h"
 #include "logging.h"
 
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#endif
+
 bool file_exists(const char* path) {
     if (!path) return false;
     
@@ -261,6 +265,50 @@ const char* get_file_extension(const char* path) {
     const char* ext = strrchr(filename, '.');
     
     return ext ? ext + 1 : "";
+}
+
+bool is_safe_path(const char* path) {
+    if (!path) return false;
+    
+    // Reject paths containing ".."
+    if (strstr(path, "..") != NULL) return false;
+    
+    // Reject absolute paths on Unix
+#ifndef _WIN32
+    if (path[0] == '/') return false;
+#else
+    // Reject absolute paths on Windows (drive letters)
+    if (strlen(path) > 1 && path[1] == ':') return false;
+    // Reject UNC paths
+    if (strlen(path) > 1 && path[0] == '\\' && path[1] == '\\') return false;
+#endif
+    
+    // Reject paths that are too long
+    if (strlen(path) >= PATH_MAX) return false;
+    
+    return true;
+}
+
+bool is_suspicious_file(const char* filename) {
+    if (!filename) return false;
+    
+    const char* ext = get_file_extension(filename);
+    if (!ext) return false;
+    
+    // List of potentially dangerous file extensions
+    const char* dangerous_exts[] = {
+        "exe", "com", "bat", "cmd", "pif", "scr", "vbs", "js", "jar",
+        "app", "deb", "pkg", "dmg", "run", "msi", "dll", "so", "dylib",
+        NULL
+    };
+    
+    for (int i = 0; dangerous_exts[i]; i++) {
+        if (strcasecmp(ext, dangerous_exts[i]) == 0) {
+            return true;
+        }
+    }
+    
+    return false;
 }
 
 int traverse_directory(const char* dir_path, bool recursive, file_callback_t callback, void* user_data) {
