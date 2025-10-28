@@ -2,6 +2,27 @@
 #include "gbzip_zip.h"
 #include "zipignore.h"
 #include "utils.h"
+#include "logging.h"
+
+#ifndef _WIN32
+    #include <pthread.h>
+    #include <unistd.h>
+#else
+    #include <windows.h>
+#endif
+
+// Global variables for progress monitoring
+static volatile bool g_compression_active = false;
+static progress_t* g_progress_ptr = NULL;
+static bool g_show_progress = false;
+static volatile size_t g_total_compressed_bytes = 0;
+static char g_output_filename[PATH_MAX] = {0};
+
+#ifndef _WIN32
+static pthread_t g_progress_thread;
+#else
+static HANDLE g_progress_handle = NULL;
+#endif
 
 static int count_files_callback(const file_info_t* info, void* user_data) {
     (void)info; // Suppress unused parameter warning
@@ -15,9 +36,7 @@ static int add_file_callback(const file_info_t* info, void* user_data) {
     
     // Check if file should be ignored
     if (should_ignore(&ctx->zipignore, info->path)) {
-        if (ctx->verbose) {
-            printf("Ignoring: %s\n", info->path);
-        }
+        log_file_operation("Ignored", info->path, info->size);
         return EXIT_SUCCESS;
     }
     
@@ -54,9 +73,7 @@ static int add_file_callback(const file_info_t* info, void* user_data) {
             return EXIT_ZIP_ERROR;
         }
         
-        if (ctx->verbose) {
-            printf("Added directory: %s\n", archive_path);
-        }
+        log_file_operation("Added directory", archive_path, 0);
     } else {
         // Add regular file
         int result = add_file_to_zip(ctx, info->path, archive_path);
@@ -66,6 +83,13 @@ static int add_file_callback(const file_info_t* info, void* user_data) {
     }
     
     update_progress(&ctx->progress, info->size);
+    
+    // Track large files for better finalization estimates
+    if (info->size > 10 * 1024 * 1024) { // Files larger than 10MB
+        ctx->progress.large_files_count++;
+        ctx->progress.large_files_bytes += info->size;
+    }
+    
     if (ctx->verbose) {
         print_progress(&ctx->progress, "Creating");
     }
@@ -104,7 +128,16 @@ static int add_single_file(zip_context_t* ctx, const char* file_path) {
     
     int result = add_file_to_zip(ctx, file_path, archive_path);
     if (result == EXIT_SUCCESS) {
+        off_t file_size = get_file_size(file_path);
         ctx->progress.processed_files++;
+        ctx->progress.processed_bytes += file_size;
+        
+        // Track large files for better finalization estimates
+        if (file_size > 10 * 1024 * 1024) { // Files larger than 10MB
+            ctx->progress.large_files_count++;
+            ctx->progress.large_files_bytes += file_size;
+        }
+        
         if (ctx->verbose) {
             print_progress(&ctx->progress, "Creating");
         }
@@ -188,10 +221,8 @@ int create_zip(const options_t* opts) {
         }
     }
     
-    if (ctx.verbose) {
-        printf("Creating ZIP archive '%s'\n", opts->zip_file);
-        printf("Total files to process: %zu\n", ctx.progress.total_files);
-    }
+    log_event(EVENT_INIT, LOG_INFO, "Creating ZIP archive '%s'", opts->zip_file);
+    log_event(EVENT_INIT, LOG_INFO, "Total files to process: %zu", ctx.progress.total_files);
     
     // Add files to ZIP
     if (opts->input_file_count > 0) {
@@ -214,20 +245,40 @@ int create_zip(const options_t* opts) {
     }
     
     if (result == EXIT_SUCCESS) {
-        // Close ZIP archive
-        if (ctx.verbose) {
-            printf("\nFinalizing archive...");
-            fflush(stdout);
+        // Switch to finalization phase
+        set_progress_phase(&ctx.progress, PHASE_FINALIZING, 0.02);
+        
+        if (ctx.progress.large_files_count > 0) {
+            double large_mb = ctx.progress.large_files_bytes / (1024.0 * 1024.0);
+            log_event(EVENT_COMPRESSION, LOG_INFO, "Compressing %zu large files (%.1f MB) - this may take several minutes", 
+                     ctx.progress.large_files_count, large_mb);
+        } else if (ctx.progress.total_files > 100) {
+            log_event(EVENT_COMPRESSION, LOG_INFO, "Finalizing archive (this may take a while for large archives)");
         }
-        if (zip_close(ctx.archive) < 0) {
-            fprintf(stderr, "Error closing ZIP file: %s\n", zip_strerror(ctx.archive));
+        
+        if (!g_log_config.structured && ctx.verbose) {
+            printf("\n");
+        }
+        
+        // Close ZIP archive with progress updates (this is where the actual compression and writing happens)
+        int close_result = zip_close_with_progress(ctx.archive, &ctx.progress, ctx.verbose, opts->zip_file);
+        if (close_result < 0) {
+            fprintf(stderr, "\nError closing ZIP file: %s\n", zip_strerror(ctx.archive));
             result = EXIT_ZIP_ERROR;
         } else {
-            if (ctx.verbose) {
-                printf(" done\n");
-                printf("ZIP archive created successfully\n");
-                printf("Files processed: %zu\n", ctx.progress.processed_files);
-                printf("Total size: %zu bytes\n", ctx.progress.processed_bytes);
+            time_t elapsed = time(NULL) - ctx.progress.start_time;
+            log_archive_info(opts->zip_file, ctx.progress.processed_files, ctx.progress.processed_bytes, (double)elapsed);
+            
+            if (!g_log_config.structured) {
+                if (ctx.verbose) {
+                    printf(" done\n");
+                } else if (ctx.progress.total_files > 100) {
+                    printf(" done\n");
+                }
+                
+                if (!ctx.verbose && !opts->quiet) {
+                    printf("Created '%s' with %zu files\n", opts->zip_file, ctx.progress.processed_files);
+                }
             }
         }
     } else {
@@ -235,6 +286,131 @@ int create_zip(const options_t* opts) {
     }
     
     free_zipignore(&ctx.zipignore);
+    return result;
+}
+
+#ifndef _WIN32
+// Unix/Linux/macOS progress thread
+void* progress_thread(void* arg) {
+    (void)arg; // Suppress unused parameter warning
+    int step = 0;
+    size_t last_file_size = 0;
+    
+    while (g_compression_active) {
+        if (g_show_progress && g_progress_ptr) {
+            // Monitor output file size growth if we have a filename
+            if (g_output_filename[0] != '\0' && file_exists(g_output_filename)) {
+                size_t current_file_size = get_file_size(g_output_filename);
+                if (current_file_size > last_file_size) {
+                    g_total_compressed_bytes = current_file_size;
+                    last_file_size = current_file_size;
+                }
+            }
+            
+            print_compression_progress(g_progress_ptr, step++);
+        }
+        sleep(1); // Update every 1 second
+    }
+    return NULL;
+}
+#else
+// Windows progress thread
+DWORD WINAPI progress_thread(LPVOID arg) {
+    (void)arg; // Suppress unused parameter warning
+    int step = 0;
+    size_t last_file_size = 0;
+    
+    while (g_compression_active) {
+        if (g_show_progress && g_progress_ptr) {
+            // Monitor output file size growth if we have a filename
+            if (g_output_filename[0] != '\0' && file_exists(g_output_filename)) {
+                size_t current_file_size = get_file_size(g_output_filename);
+                if (current_file_size > last_file_size) {
+                    g_total_compressed_bytes = current_file_size;
+                    last_file_size = current_file_size;
+                }
+            }
+            
+            print_compression_progress(g_progress_ptr, step++);
+        }
+        Sleep(1000); // Update every 1 second
+    }
+    return 0;
+}
+#endif
+
+
+// Cross-platform function to close ZIP archive with progress updates
+int zip_close_with_progress(zip_t* archive, progress_t* progress, bool verbose, const char* output_filename) {
+    if (!archive) return -1;
+    
+    // For smaller archives, just close normally without extra output
+    if (!progress || (progress->large_files_bytes < 5 * 1024 * 1024 && progress->total_files < 50)) {
+        return zip_close(archive);
+    }
+    
+    // Determine if we should show progress
+    bool show_progress = verbose || progress->large_files_bytes > 20 * 1024 * 1024;
+    time_t start_compression = time(NULL);
+    
+    if (show_progress) {
+        // Store output filename for file size monitoring
+        if (output_filename) {
+            strncpy(g_output_filename, output_filename, PATH_MAX - 1);
+            g_output_filename[PATH_MAX - 1] = '\0';
+        }
+        
+        g_progress_ptr = progress;
+        g_show_progress = true;
+        g_compression_active = true;
+        g_total_compressed_bytes = 0;
+        
+        // Start progress thread
+        #ifndef _WIN32
+            pthread_create(&g_progress_thread, NULL, progress_thread, NULL);
+        #else
+            g_progress_handle = CreateThread(NULL, 0, progress_thread, NULL, 0, NULL);
+        #endif
+        
+        print_compression_progress(progress, 0);
+        fflush(stdout);
+    }
+    
+    // Perform the actual compression
+    int result = zip_close(archive);
+    
+    // Stop progress monitoring
+    if (show_progress) {
+        g_compression_active = false;
+        
+        // Wait for progress thread to finish
+        #ifndef _WIN32
+            pthread_join(g_progress_thread, NULL);
+        #else
+            if (g_progress_handle) {
+                WaitForSingleObject(g_progress_handle, 1000);
+                CloseHandle(g_progress_handle);
+                g_progress_handle = NULL;
+            }
+        #endif
+        
+        time_t end_compression = time(NULL);
+        long compression_time = end_compression - start_compression;
+        
+        if (result == 0) {
+            printf("\rCompressing and writing archive ✓ (100.0%%) - completed in %lds", compression_time);
+            if (compression_time > 10) {
+                printf("\n  Large file compression required extended time");
+            }
+            printf("\n");
+        } else {
+            printf("\rCompression failed after %lds\n", compression_time);
+        }
+        
+        // Clear the filename
+        g_output_filename[0] = '\0';
+    }
+    
     return result;
 }
 
@@ -394,8 +570,11 @@ int add_file_to_zip(zip_context_t* ctx, const char* file_path, const char* archi
         zip_file_set_mtime(ctx->archive, idx, mtime, 0);
     }
     
-    if (ctx->verbose) {
-        printf("Added file: %s\n", archive_path);
+    off_t file_size = get_file_size(file_path);
+    if (file_size > 10 * 1024 * 1024) { // Files larger than 10MB
+        log_file_operation("Added large file", archive_path, file_size);
+    } else {
+        log_file_operation("Added file", archive_path, file_size);
     }
     
     return EXIT_SUCCESS;

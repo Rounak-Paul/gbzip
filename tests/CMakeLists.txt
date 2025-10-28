@@ -6,6 +6,7 @@ set(TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/zipignore.c
     ${CMAKE_SOURCE_DIR}/src/zip.c
     ${CMAKE_SOURCE_DIR}/src/diff.c
+    ${CMAKE_SOURCE_DIR}/src/logging.c
 )
 
 # Add a simple test

@@ -34,6 +34,9 @@ int traverse_directory(const char* dir_path, bool recursive, file_callback_t cal
 
 void init_progress(progress_t* progress);
 void update_progress(progress_t* progress, size_t bytes_processed);
+void set_progress_phase(progress_t* progress, progress_phase_t phase, double weight);
 void print_progress(const progress_t* progress, const char* operation);
+void print_finalization_progress(const progress_t* progress, const char* message);
+void print_compression_progress(const progress_t* progress, int step);
 
 #endif // UTILS_H

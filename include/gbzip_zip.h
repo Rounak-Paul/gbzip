@@ -23,6 +23,7 @@ int list_zip(const options_t* opts);
 int add_file_to_zip(zip_context_t* ctx, const char* file_path, const char* archive_path);
 int add_directory_to_zip(zip_context_t* ctx, const char* dir_path, const char* base_path);
 int extract_file_from_zip(zip_context_t* ctx, zip_uint64_t index, const char* output_dir);
+int zip_close_with_progress(zip_t* archive, progress_t* progress, bool verbose, const char* output_filename);
 
 // ZIP file information
 typedef struct {

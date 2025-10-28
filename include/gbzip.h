@@ -70,6 +70,7 @@ typedef struct {
     int input_file_count;
     bool verbose;
     bool quiet;
+    bool structured;
     bool recursive;
     bool force;
     bool junk_paths;
@@ -87,12 +88,21 @@ typedef struct {
 } options_t;
 
 // Progress reporting
+typedef enum {
+    PHASE_ADDING_FILES,
+    PHASE_FINALIZING
+} progress_phase_t;
+
 typedef struct {
     size_t total_files;
     size_t processed_files;
     size_t total_bytes;
     size_t processed_bytes;
     time_t start_time;
+    progress_phase_t phase;
+    double phase_weight; // Weight of current phase (0.0 to 1.0)
+    size_t large_files_count; // Files > 10MB
+    size_t large_files_bytes; // Total bytes in large files
 } progress_t;
 
 // Function prototypes

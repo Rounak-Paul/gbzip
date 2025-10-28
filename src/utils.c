@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "logging.h"
 
 bool file_exists(const char* path) {
     if (!path) return false;
@@ -380,6 +381,8 @@ void init_progress(progress_t* progress) {
     
     memset(progress, 0, sizeof(progress_t));
     progress->start_time = time(NULL);
+    progress->phase = PHASE_ADDING_FILES;
+    progress->phase_weight = 0.02; // File adding takes only 2% of progress
 }
 
 void update_progress(progress_t* progress, size_t bytes_processed) {
@@ -387,6 +390,13 @@ void update_progress(progress_t* progress, size_t bytes_processed) {
     
     progress->processed_files++;
     progress->processed_bytes += bytes_processed;
+}
+
+void set_progress_phase(progress_t* progress, progress_phase_t phase, double weight) {
+    if (!progress) return;
+    
+    progress->phase = phase;
+    progress->phase_weight = weight;
 }
 
 void print_progress(const progress_t* progress, const char* operation) {
@@ -397,7 +407,14 @@ void print_progress(const progress_t* progress, const char* operation) {
     
     double percent = 0.0;
     if (progress->total_files > 0) {
-        percent = (double)progress->processed_files / progress->total_files * 100.0;
+        if (progress->phase == PHASE_ADDING_FILES) {
+            // During file adding phase, show 0-2% progress
+            double file_percent = (double)progress->processed_files / progress->total_files;
+            percent = file_percent * progress->phase_weight * 100.0;
+        } else {
+            // During finalization phase, show 2-100% progress
+            percent = progress->phase_weight * 100.0;
+        }
     }
     
     double speed = (double)progress->processed_bytes / elapsed;
@@ -412,8 +429,90 @@ void print_progress(const progress_t* progress, const char* operation) {
         }
     }
     
-    printf("\r%s: %zu/%zu files (%.1f%%) - %.1f %s", 
-           operation, progress->processed_files, progress->total_files, 
-           percent, speed, units);
+    const char* phase_name = (progress->phase == PHASE_ADDING_FILES) ? "adding_files" : "finalizing";
+    log_progress_structured(progress, phase_name, percent, speed, units);
     fflush(stdout);
+}
+
+void print_finalization_progress(const progress_t* progress, const char* message) {
+    if (!progress || !message) return;
+    
+    time_t elapsed = time(NULL) - progress->start_time;
+    if (elapsed == 0) elapsed = 1; // Avoid division by zero
+    
+    double speed = (double)progress->processed_bytes / elapsed;
+    const char* units = "B/s";
+    
+    if (speed > 1024) {
+        speed /= 1024;
+        units = "KB/s";
+        if (speed > 1024) {
+            speed /= 1024;
+            units = "MB/s";
+        }
+    }
+    
+    printf("\r%s (%.1f %s)...", message, speed, units);
+    fflush(stdout);
+}
+
+void print_compression_progress(const progress_t* progress, int step) {
+    if (!progress) return;
+    
+    time_t current_time = time(NULL);
+    time_t elapsed = current_time - progress->start_time;
+    if (elapsed == 0) elapsed = 1;
+    
+    double speed = (double)progress->processed_bytes / elapsed;
+    const char* units = "B/s";
+    
+    if (speed > 1024) {
+        speed /= 1024;
+        units = "KB/s";
+        if (speed > 1024) {
+            speed /= 1024;
+            units = "MB/s";
+        }
+    }
+    
+    // Simple animation to show progress
+    const char* spinner = "|/-\\";
+    char animation = spinner[step % 4];
+    
+    // More realistic progress estimation during compression
+    double estimated_progress = 90.0; // Start at 90% (end of file adding phase)
+    
+    if (progress->large_files_bytes > 0) {
+        // Estimate based on compression time for large files
+        // Assume roughly 30-50 MB/s compression speed for large files
+        double estimated_compression_time = (double)progress->large_files_bytes / (40.0 * 1024.0 * 1024.0); // 40 MB/s average
+        if (estimated_compression_time < 5.0) estimated_compression_time = 5.0; // Minimum 5 seconds
+        
+        double compression_progress = (double)elapsed / estimated_compression_time;
+        if (compression_progress > 1.0) compression_progress = 1.0;
+        
+        // Progress from 2% to 99.5% based on estimated compression time
+        estimated_progress = 2.0 + (compression_progress * 97.5);
+    } else {
+        // For smaller files, more linear progress over time
+        double time_factor = (double)elapsed / 30.0; // Assume 30 seconds max for small files
+        if (time_factor > 1.0) time_factor = 1.0;
+        estimated_progress = 2.0 + (time_factor * 97.5);
+    }
+    
+    if (estimated_progress > 99.5) estimated_progress = 99.5; // Don't show 100% until done
+    
+    // Use structured logging for compression progress, but maintain animation for traditional output
+    if (g_log_config.structured) {
+        static progress_t temp_progress = {0};
+        temp_progress.start_time = progress->start_time;
+        temp_progress.processed_bytes = progress->processed_bytes;
+        temp_progress.total_files = progress->total_files;
+        temp_progress.processed_files = progress->processed_files;
+        log_progress_structured(&temp_progress, "compression", estimated_progress, speed, units);
+    } else {
+        printf("\rCompressing and writing archive %c (%.1f%%) - %.1f %s - %lds elapsed", 
+               animation, estimated_progress, speed, units, elapsed);
+        fflush(stdout);
+    }
 }

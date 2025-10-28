@@ -3,6 +3,7 @@
 #include "zipignore.h"
 #include "diff.h"
 #include "utils.h"
+#include "logging.h"
 
 void print_usage(const char* program_name) {
     printf("gbzip - Advanced ZIP utility with ignore files and diff support\n\n");
@@ -14,8 +15,8 @@ void print_usage(const char* program_name) {
     printf("  -0   store only (no compression)            -9   compress better\n");
     printf("  -q   quiet operation                         -v   verbose operation\n");
     printf("  -f   force overwrite existing files         -u   update: only changed or new files\n");
-    printf("  -x   extract files from zipfile             -l   list files in zipfile\n");
-    printf("  -t   test zipfile integrity                 -T   timestamp archive to latest\n");
+    printf("  -s   structured output (JSON-like for UI)   -x   extract files from zipfile\n");
+    printf("  -l   list files in zipfile                  -T   timestamp archive to latest\n");
     printf("  -d <dir>  extract files into directory     -m   move into zipfile (delete OS files)\n");
     printf("  -i   include only files matching patterns   -@   read names from stdin\n");
     printf("  -I <file>  use custom zipignore file        -Z   create default .zipignore file\n");
@@ -45,6 +46,7 @@ int parse_arguments(int argc, char* argv[], options_t* opts) {
     opts->recursive = true;
     opts->verbose = false;
     opts->quiet = false;
+    opts->structured = false;
     opts->force = false;
     opts->junk_paths = false;
     opts->store_only = false;
@@ -91,6 +93,9 @@ int parse_arguments(int argc, char* argv[], options_t* opts) {
                 case 'q':
                     opts->quiet = true;
                     opts->verbose = false;
+                    break;
+                case 's':
+                    opts->structured = true;
                     break;
                 case 'f':
                     opts->force = true;
@@ -214,6 +219,15 @@ int main(int argc, char* argv[]) {
         }
         return result;
     }
+    
+    // Initialize logging system
+    log_config_t log_config = {
+        .verbose = opts.verbose,
+        .quiet = opts.quiet,
+        .structured = opts.structured,
+        .output_stream = stdout
+    };
+    init_logging(&log_config);
     
     // Handle special case for creating default zipignore
     if (opts.create_default_zipignore) {

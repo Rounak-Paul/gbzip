@@ -70,6 +70,7 @@ set(SOURCES
     src/zipignore.c
     src/diff.c
     src/utils.c
+    src/logging.c
 )
 
 # Header files
@@ -79,6 +80,7 @@ set(HEADERS
     include/zipignore.h
     include/diff.h
     include/utils.h
+    include/logging.h
 )
 
 # Create executable
