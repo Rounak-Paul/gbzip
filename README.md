@@ -1,69 +1,94 @@
 # gbzip
 
-Fast ZIP utility with gitignore-style patterns and real-time progress.
+A ZIP utility with gitignore-style patterns and real-time progress reporting.
 
-## Install
+## Installation
 
 ```bash
 git clone https://github.com/yourusername/gbzip.git
-cd gbzip && mkdir build && cd build
+cd gbzip
+mkdir build && cd build
 cmake .. && make
 ```
 
-**Dependencies:** CMake, libzip (`brew install libzip` or `apt install libzip-dev`)
+Requires CMake and libzip. On macOS: `brew install libzip`. On Ubuntu/Debian: `apt install libzip-dev`.
 
-## Use Cases
+## Basic Usage
 
-### 📁 Project Archives
+Create archives:
 ```bash
-# Exclude build files automatically
-echo -e "build/\n*.tmp\n.git/\nnode_modules/" > .zipignore
-gbzip project.zip .
+gbzip archive.zip file1.txt file2.txt
+gbzip archive.zip directory/
 ```
 
-### 🚀 Large File Processing
+Extract archives:
 ```bash
-# Real-time progress for big datasets
-gbzip -v dataset.zip data/
-# Shows: Creating (2%) → Compressing (2-100%) with speed metrics
+gbzip -x archive.zip
+gbzip -x -d destination/ archive.zip
 ```
 
-### 🔄 Incremental Backups
+List contents:
 ```bash
-gbzip -D backup.zip ~/Documents  # Only changed files
+gbzip -l archive.zip
 ```
 
-### 🎯 UI Integration
-```bash
-gbzip -s archive.zip files/  # JSON output for GUIs
-# {"event":"PROGRESS","percent":45.2,"speed":30.7,"speed_units":"MB/s"...}
-```
+## Ignore Patterns
 
-### ⚡ Quick Operations
-```bash
-gbzip archive.zip file1 file2    # Create
-gbzip -x archive.zip             # Extract  
-gbzip -l archive.zip             # List
-```
-
-## Key Options
-
-- `-v` verbose with progress bar
-- `-s` structured JSON output for UIs
-- `-D` differential (changed files only)
-- `-I file` custom ignore patterns
-- `-0/-9` compression level
-- `-x` extract, `-l` list
-
-## Ignore Patterns (`.zipignore`)
+Create a `.zipignore` file to exclude files during archiving:
 
 ```
-build/           # directories
-*.tmp            # extensions  
-node_modules/    # common excludes
-venv/
+build/
+*.tmp
 .git/
-!important.log   # exceptions
+node_modules/
+venv/
+!important.log
 ```
 
-Works like `.gitignore` - patterns are processed efficiently during traversal.
+Uses gitignore syntax. Patterns are processed during directory traversal for efficiency.
+
+## Progress Reporting
+
+For large files, use verbose mode to see real-time progress:
+```bash
+gbzip -v dataset.zip large_directory/
+```
+
+Shows file processing progress (0-2%) followed by compression progress (2-100%) with transfer speeds.
+
+## Advanced Features
+
+Differential updates (only process changed files):
+```bash
+gbzip -D backup.zip ~/Documents
+```
+
+Custom ignore file:
+```bash
+gbzip -I custom.ignore archive.zip .
+```
+
+Compression levels:
+```bash
+gbzip -0 fast.zip files/     # no compression
+gbzip -9 small.zip files/    # maximum compression
+```
+
+Machine-readable output for GUI applications:
+```bash
+gbzip -s archive.zip files/
+```
+
+Outputs JSON events for progress tracking and status updates.
+
+## Options
+
+- `-v` verbose output with progress
+- `-q` quiet operation
+- `-s` structured JSON output
+- `-D` differential update
+- `-I <file>` custom ignore patterns
+- `-x` extract mode
+- `-l` list contents
+- `-f` force overwrite
+- `-0` to `-9` compression level

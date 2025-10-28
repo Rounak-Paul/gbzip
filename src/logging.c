@@ -21,30 +21,18 @@ void init_logging(log_config_t* config) {
 }
 
 const char* get_event_name(event_type_t event) {
-    switch (event) {
-        case EVENT_INIT: return "INIT";
-        case EVENT_FILE_ADD: return "FILE_ADD";
-        case EVENT_FILE_IGNORE: return "FILE_IGNORE";
-        case EVENT_PROGRESS: return "PROGRESS";
-        case EVENT_COMPRESSION: return "COMPRESSION";
-        case EVENT_FINALIZE: return "FINALIZE";
-        case EVENT_COMPLETE: return "COMPLETE";
-        case EVENT_ERROR: return "ERROR";
-        case EVENT_WARNING: return "WARNING";
-        default: return "UNKNOWN";
-    }
+    static const char* names[] = {
+        "INIT", "FILE_ADD", "FILE_IGNORE", "PROGRESS", "COMPRESSION",
+        "FINALIZE", "COMPLETE", "ERROR", "WARNING"
+    };
+    return (event < sizeof(names)/sizeof(names[0])) ? names[event] : "UNKNOWN";
 }
 
 const char* get_level_name(log_level_t level) {
-    switch (level) {
-        case LOG_DEBUG: return "DEBUG";
-        case LOG_INFO: return "INFO";
-        case LOG_PROGRESS: return "PROGRESS";
-        case LOG_WARNING: return "WARNING";
-        case LOG_ERROR: return "ERROR";
-        case LOG_SUCCESS: return "SUCCESS";
-        default: return "UNKNOWN";
-    }
+    static const char* names[] = {
+        "DEBUG", "INFO", "PROGRESS", "WARNING", "ERROR", "SUCCESS"
+    };
+    return (level < sizeof(names)/sizeof(names[0])) ? names[level] : "UNKNOWN";
 }
 
 const char* format_timestamp(void) {
@@ -70,7 +58,6 @@ void log_event(event_type_t event, log_level_t level, const char* format, ...) {
         vfprintf(g_log_config.output_stream, format, args);
         fprintf(g_log_config.output_stream, "\"}\n");
     } else {
-        // Traditional human-readable output
         if (g_log_config.verbose) {
             fprintf(g_log_config.output_stream, "[%s] %s: ", get_level_name(level), get_event_name(event));
         }
@@ -84,7 +71,7 @@ void log_event(event_type_t event, log_level_t level, const char* format, ...) {
     fflush(g_log_config.output_stream);
 }
 
-void log_progress_structured(const progress_t* progress, const char* phase, double percent, double speed, const char* speed_units) {
+void log_progress(const progress_t* progress, const char* phase, double percent, double speed, const char* speed_units) {
     if (g_log_config.quiet) {
         return;
     }
@@ -99,9 +86,7 @@ void log_progress_structured(const progress_t* progress, const char* phase, doub
                 format_timestamp(), phase, percent, progress->processed_files, progress->total_files,
                 progress->processed_bytes, speed, speed_units, elapsed);
     } else {
-        // Traditional progress output
         if (strcmp(phase, "compression") == 0) {
-            // Compression phase with animation
             const char* spinner = "|/-\\";
             static int step = 0;
             char animation = spinner[step % 4];
@@ -176,7 +161,7 @@ void log_archive_info(const char* archive_path, size_t total_files, size_t total
     fflush(g_log_config.output_stream);
 }
 
-void log_error_structured(const char* context, const char* error_message) {
+void log_error(const char* context, const char* error_message) {
     if (g_log_config.structured) {
         fprintf(stderr,
                 "{\"timestamp\":\"%s\",\"event\":\"ERROR\",\"level\":\"ERROR\","

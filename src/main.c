@@ -6,10 +6,8 @@
 #include "logging.h"
 
 void print_usage(const char* program_name) {
-    printf("gbzip - Advanced ZIP utility with ignore files and diff support\n\n");
-    printf("Usage: %s [-options] zipfile [file...] [-xi list]\n\n", program_name);
-    printf("  The default action is to add or replace zipfile entries from list.\n");
-    printf("  If zipfile and list are omitted, gbzip compresses stdin to stdout.\n\n");
+    printf("gbzip - ZIP utility with gitignore-style patterns\n\n");
+    printf("Usage: %s [-options] zipfile [file...]\n\n", program_name);
     printf("Options:\n");
     printf("  -r   recurse into directories (default)     -j   junk (don't record) directory names\n");
     printf("  -0   store only (no compression)            -9   compress better\n");
@@ -34,32 +32,15 @@ void print_usage(const char* program_name) {
 }
 
 void print_version(void) {
-    printf("gbzip version %s\n", GBZIP_VERSION);
-    printf("Advanced ZIP utility with ignore files and differential archiving\n");
-    printf("Built with libzip support for cross-platform compatibility\n");
+    printf("gbzip %s\n", GBZIP_VERSION);
 }
 
 int parse_arguments(int argc, char* argv[], options_t* opts) {
-    // Initialize options with defaults
     memset(opts, 0, sizeof(options_t));
-    opts->operation = OP_CREATE; // Default operation is create
+    opts->operation = OP_CREATE;
     opts->recursive = true;
-    opts->verbose = false;
-    opts->quiet = false;
-    opts->structured = false;
-    opts->force = false;
-    opts->junk_paths = false;
-    opts->store_only = false;
-    opts->compress_better = false;
-    opts->update_mode = false;
-    opts->test_mode = false;
-    opts->timestamp_mode = false;
-    opts->delete_mode = false;
-    opts->move_mode = false;
-    opts->read_stdin = false;
-    opts->diff_mode = false;
-    opts->create_default_zipignore = false;
-    opts->compression_level = 6; // Default compression level
+    opts->compression_level = 6;
+
     
     if (argc < 2) {
         opts->operation = OP_HELP;
@@ -68,11 +49,11 @@ int parse_arguments(int argc, char* argv[], options_t* opts) {
     
     int arg_index = 1;
     
-    // Parse options (zip-style)
+
     while (arg_index < argc && argv[arg_index][0] == '-') {
         const char* arg = argv[arg_index];
         
-        // Handle long options
+
         if (strcmp(arg, "--version") == 0) {
             opts->operation = OP_VERSION;
             return EXIT_SUCCESS;
@@ -81,7 +62,7 @@ int parse_arguments(int argc, char* argv[], options_t* opts) {
             return EXIT_SUCCESS;
         }
         
-        // Handle combined short options (like -rv)
+
         for (int i = 1; arg[i] != '\0'; i++) {
             switch (arg[i]) {
                 case 'r':
@@ -220,16 +201,13 @@ int main(int argc, char* argv[]) {
         return result;
     }
     
-    // Initialize logging system
-    log_config_t log_config = {
-        .verbose = opts.verbose,
-        .quiet = opts.quiet,
-        .structured = opts.structured,
-        .output_stream = stdout
-    };
+    log_config_t log_config = {0};
+    log_config.verbose = opts.verbose;
+    log_config.quiet = opts.quiet;
+    log_config.structured = opts.structured;
+    log_config.output_stream = stdout;
     init_logging(&log_config);
     
-    // Handle special case for creating default zipignore
     if (opts.create_default_zipignore) {
         return create_default_zipignore();
     }

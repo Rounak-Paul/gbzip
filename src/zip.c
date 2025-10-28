@@ -34,13 +34,12 @@ static int count_files_callback(const file_info_t* info, void* user_data) {
 static int add_file_callback(const file_info_t* info, void* user_data) {
     zip_context_t* ctx = (zip_context_t*)user_data;
     
-    // Check if file should be ignored
     if (should_ignore(&ctx->zipignore, info->path)) {
         log_file_operation("Ignored", info->path, info->size);
         return EXIT_SUCCESS;
     }
     
-    // Calculate relative path for archive
+
     const char* base_dir = ctx->zipignore.base_dir;
     const char* relative_path = info->path;
     
@@ -51,7 +50,7 @@ static int add_file_callback(const file_info_t* info, void* user_data) {
         }
     }
     
-    // Convert path separators to forward slashes for ZIP
+
     char archive_path[PATH_MAX];
     strncpy(archive_path, relative_path, PATH_MAX - 1);
     archive_path[PATH_MAX - 1] = '\0';
@@ -63,7 +62,7 @@ static int add_file_callback(const file_info_t* info, void* user_data) {
     }
     
     if (info->is_directory) {
-        // Add directory (with trailing slash)
+
         strcat(archive_path, "/");
         
         zip_int64_t idx = zip_dir_add(ctx->archive, archive_path, ZIP_FL_ENC_UTF_8);
@@ -75,7 +74,7 @@ static int add_file_callback(const file_info_t* info, void* user_data) {
         
         log_file_operation("Added directory", archive_path, 0);
     } else {
-        // Add regular file
+
         int result = add_file_to_zip(ctx, info->path, archive_path);
         if (result != EXIT_SUCCESS) {
             return result;
@@ -85,7 +84,7 @@ static int add_file_callback(const file_info_t* info, void* user_data) {
     update_progress(&ctx->progress, info->size);
     
     // Track large files for better finalization estimates
-    if (info->size > 10 * 1024 * 1024) { // Files larger than 10MB
+    if (info->size > 10 * 1024 * 1024) {
         ctx->progress.large_files_count++;
         ctx->progress.large_files_bytes += info->size;
     }

@@ -382,7 +382,7 @@ void init_progress(progress_t* progress) {
     memset(progress, 0, sizeof(progress_t));
     progress->start_time = time(NULL);
     progress->phase = PHASE_ADDING_FILES;
-    progress->phase_weight = 0.02; // File adding takes only 2% of progress
+    progress->phase_weight = 0.02;
 }
 
 void update_progress(progress_t* progress, size_t bytes_processed) {
@@ -403,16 +403,14 @@ void print_progress(const progress_t* progress, const char* operation) {
     if (!progress || !operation) return;
     
     time_t elapsed = time(NULL) - progress->start_time;
-    if (elapsed == 0) elapsed = 1; // Avoid division by zero
+    if (elapsed == 0) elapsed = 1;
     
     double percent = 0.0;
     if (progress->total_files > 0) {
         if (progress->phase == PHASE_ADDING_FILES) {
-            // During file adding phase, show 0-2% progress
             double file_percent = (double)progress->processed_files / progress->total_files;
             percent = file_percent * progress->phase_weight * 100.0;
         } else {
-            // During finalization phase, show 2-100% progress
             percent = progress->phase_weight * 100.0;
         }
     }
@@ -430,7 +428,7 @@ void print_progress(const progress_t* progress, const char* operation) {
     }
     
     const char* phase_name = (progress->phase == PHASE_ADDING_FILES) ? "adding_files" : "finalizing";
-    log_progress_structured(progress, phase_name, percent, speed, units);
+    log_progress(progress, phase_name, percent, speed, units);
     fflush(stdout);
 }
 
@@ -509,7 +507,7 @@ void print_compression_progress(const progress_t* progress, int step) {
         temp_progress.processed_bytes = progress->processed_bytes;
         temp_progress.total_files = progress->total_files;
         temp_progress.processed_files = progress->processed_files;
-        log_progress_structured(&temp_progress, "compression", estimated_progress, speed, units);
+        log_progress(&temp_progress, "compression", estimated_progress, speed, units);
     } else {
         printf("\rCompressing and writing archive %c (%.1f%%) - %.1f %s - %lds elapsed", 
                animation, estimated_progress, speed, units, elapsed);
