@@ -81,6 +81,7 @@ set(SOURCES
     src/diff.c
     src/utils.c
     src/logging.c
+    src/tui.c
 )
 
 # Header files
@@ -91,6 +92,7 @@ set(HEADERS
     include/diff.h
     include/utils.h
     include/logging.h
+    include/tui.h
 )
 
 # Create executable

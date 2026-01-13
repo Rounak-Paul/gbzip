@@ -4,6 +4,7 @@
 #include "zipignore.h"
 #include "utils.h"
 #include "logging.h"
+#include "tui.h"
 
 #ifndef _WIN32
     #include <pthread.h>
@@ -406,6 +407,21 @@ static void pool_wait(thread_pool_t* pool, size_t expected_count) {
 #endif
 }
 
+// Check if all work is done (non-blocking)
+static bool pool_is_done(thread_pool_t* pool, size_t expected_count) {
+    bool done;
+#ifndef _WIN32
+    pthread_mutex_lock(&pool->mutex);
+    done = pool->completed_count >= expected_count;
+    pthread_mutex_unlock(&pool->mutex);
+#else
+    EnterCriticalSection(&pool->cs);
+    done = pool->completed_count >= expected_count;
+    LeaveCriticalSection(&pool->cs);
+#endif
+    return done;
+}
+
 // Destroy thread pool
 static void pool_destroy(thread_pool_t* pool) {
     if (!pool) return;
@@ -471,6 +487,7 @@ typedef struct {
     zipignore_t* zipignore;
     const char* base_dir;
     bool verbose;
+    bool use_tui;
 } collect_context_t;
 
 // Callback to collect files into the queue
@@ -493,7 +510,9 @@ static int collect_files_callback(const file_info_t* info, void* user_data) {
     
     // Check if should be ignored
     if (should_ignore(ctx->zipignore, info->path)) {
-        log_file_operation("Ignored", info->path, info->size);
+        if (!ctx->use_tui) {
+            log_file_operation("Ignored", info->path, info->size);
+        }
         return EXIT_SUCCESS;
     }
     
@@ -536,6 +555,16 @@ static int collect_files_callback(const file_info_t* info, void* user_data) {
     
     queue_push(ctx->queue, entry);
     
+    // Update TUI during scanning - refresh every 100 files
+    if (ctx->use_tui) {
+        g_tui.total_files = ctx->queue->count;
+        static size_t last_scan_refresh = 0;
+        if (ctx->queue->count - last_scan_refresh >= 100 || ctx->queue->count <= 1) {
+            tui_refresh();
+            last_scan_refresh = ctx->queue->count;
+        }
+    }
+    
     return EXIT_SUCCESS;
 }
 
@@ -549,7 +578,17 @@ int create_zip(const options_t* opts) {
     zip_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.filename = opts->zip_file;
-    ctx.verbose = opts->verbose && !opts->quiet;
+    ctx.verbose = !opts->quiet;
+    
+    // TUI is always active unless quiet mode or structured output
+    bool use_tui = !opts->quiet && !g_log_config.structured;
+    if (use_tui) {
+        tui_init();
+        tui_show_header();
+        strncpy(g_tui.operation, "Creating", sizeof(g_tui.operation));
+        strncpy(g_tui.archive_name, opts->zip_file, sizeof(g_tui.archive_name));
+        g_tui.sys_stats.num_threads = get_num_cores();
+    }
     
     // Determine base directory for zipignore loading
     const char* base_dir = ".";
@@ -571,6 +610,10 @@ int create_zip(const options_t* opts) {
     // ========================================================================
     // PHASE 1: Collect all files
     // ========================================================================
+    if (use_tui) {
+        tui_set_phase(1, "Scanning directories...");
+    }
+    
     file_queue_t file_queue;
     queue_init(&file_queue);
     
@@ -578,10 +621,11 @@ int create_zip(const options_t* opts) {
         .queue = &file_queue,
         .zipignore = &ctx.zipignore,
         .base_dir = ctx.zipignore.base_dir,
-        .verbose = ctx.verbose
+        .verbose = ctx.verbose,
+        .use_tui = use_tui
     };
     
-    if (ctx.verbose) {
+    if (ctx.verbose && !use_tui) {
         printf("Collecting files...\n");
     }
     
@@ -613,17 +657,27 @@ int create_zip(const options_t* opts) {
     size_t total_files = file_queue.count;
     size_t total_bytes = file_queue.total_bytes;
     
-    log_event(EVENT_INIT, LOG_INFO, "Creating ZIP archive '%s'", opts->zip_file);
-    log_event(EVENT_INIT, LOG_INFO, "Total files to process: %zu (%.1f MB)", 
-              total_files, total_bytes / (1024.0 * 1024.0));
+    // Update TUI with totals
+    if (use_tui) {
+        g_tui.total_files = total_files;
+        g_tui.total_bytes = total_bytes;
+    } else {
+        log_event(EVENT_INIT, LOG_INFO, "Creating ZIP archive '%s'", opts->zip_file);
+        log_event(EVENT_INIT, LOG_INFO, "Total files to process: %zu (%.1f MB)", 
+                  total_files, total_bytes / (1024.0 * 1024.0));
+    }
     
-    if (ctx.verbose) {
+    if (ctx.verbose && !use_tui) {
         printf("Found %zu files (%.1f MB)\n", total_files, total_bytes / (1024.0 * 1024.0));
     }
     
     // ========================================================================
     // PHASE 2: Parallel pre-compression of large files
     // ========================================================================
+    if (use_tui) {
+        tui_set_phase(2, "Compressing (parallel)");
+    }
+    
     size_t large_file_count = 0;
     size_t large_file_bytes = 0;
     
@@ -643,7 +697,12 @@ int create_zip(const options_t* opts) {
         int num_cores = get_num_cores();
         pool = pool_create(num_cores);
         
-        if (pool && ctx.verbose) {
+        if (use_tui) {
+            g_tui.sys_stats.num_threads = pool->num_threads;
+            g_tui.sys_stats.active_threads = pool->num_threads;
+        }
+        
+        if (pool && ctx.verbose && !use_tui) {
             printf("Using %d threads for parallel compression of %zu large files (%.1f MB)\n",
                    pool->num_threads, large_file_count, large_file_bytes / (1024.0 * 1024.0));
         }
@@ -655,13 +714,26 @@ int create_zip(const options_t* opts) {
             }
         }
         
-        // Wait for all compression to complete
-        if (ctx.verbose) {
+        // Wait for all compression to complete with TUI updates
+        if (ctx.verbose && !use_tui) {
             printf("Compressing large files in parallel...\n");
         }
-        pool_wait(pool, large_file_count);
         
-        if (ctx.verbose) {
+        if (use_tui) {
+            // Poll with TUI updates while waiting
+            while (!pool_is_done(pool, large_file_count)) {
+                tui_refresh();
+                #ifndef _WIN32
+                    usleep(100000); // 100ms
+                #else
+                    Sleep(100);
+                #endif
+            }
+        } else {
+            pool_wait(pool, large_file_count);
+        }
+        
+        if (ctx.verbose && !use_tui) {
             printf("Parallel compression complete\n");
         }
     }
@@ -669,6 +741,11 @@ int create_zip(const options_t* opts) {
     // ========================================================================
     // PHASE 3: Create ZIP archive and add files
     // ========================================================================
+    if (use_tui) {
+        tui_set_phase(3, "Adding files to archive");
+        tui_refresh(); // Show initial phase 3 line
+    }
+    
     int error;
     ctx.archive = zip_open(opts->zip_file, ZIP_CREATE | ZIP_TRUNCATE, &error);
     if (!ctx.archive) {
@@ -679,6 +756,7 @@ int create_zip(const options_t* opts) {
         zip_error_fini(&zip_error);
         queue_free(&file_queue);
         if (pool) pool_destroy(pool);
+        if (use_tui) tui_cleanup();
         return EXIT_ZIP_ERROR;
     }
     
@@ -690,6 +768,12 @@ int create_zip(const options_t* opts) {
     size_t added_count = 0;
     
     for (file_entry_t* entry = file_queue.head; entry && result == EXIT_SUCCESS; entry = entry->next) {
+        // Update TUI with current file
+        if (use_tui) {
+            tui_set_current_file(entry->archive_path);
+            tui_refresh();
+        }
+        
         if (entry->is_directory) {
             // Add directory
             zip_int64_t idx = zip_dir_add(ctx.archive, entry->archive_path, ZIP_FL_ENC_UTF_8);
@@ -717,7 +801,9 @@ int create_zip(const options_t* opts) {
                     result = add_file_to_zip(&ctx, entry->file_path, entry->archive_path);
                 } else {
                     zip_file_set_mtime(ctx.archive, idx, entry->mtime, 0);
-                    log_file_operation("Added file (pre-compressed)", entry->archive_path, entry->size);
+                    if (ctx.verbose && !use_tui) {
+                        log_file_operation("Added file (pre-compressed)", entry->archive_path, entry->size);
+                    }
                 }
             }
         } else {
@@ -729,12 +815,17 @@ int create_zip(const options_t* opts) {
             added_count++;
             update_progress(&ctx.progress, entry->size);
             
+            // Update TUI progress
+            if (use_tui) {
+                tui_update_progress(entry->size);
+            }
+            
             if (entry->size > 10 * 1024 * 1024) {
                 ctx.progress.large_files_count++;
                 ctx.progress.large_files_bytes += entry->size;
             }
             
-            if (ctx.verbose) {
+            if (ctx.verbose && !use_tui) {
                 print_progress(&ctx.progress, "Adding");
             }
         }
@@ -743,22 +834,35 @@ int create_zip(const options_t* opts) {
     // ========================================================================
     // PHASE 4: Finalize archive
     // ========================================================================
+    if (use_tui) {
+        tui_set_phase(4, "Compressing archive");
+        tui_refresh();
+    }
+    
     if (result == EXIT_SUCCESS) {
         set_progress_phase(&ctx.progress, PHASE_FINALIZING, 0.02);
         
-        if (!g_log_config.structured && ctx.verbose) {
+        if (!g_log_config.structured && ctx.verbose && !use_tui) {
             printf("\n");
         }
         
-        int close_result = zip_close_with_progress(ctx.archive, &ctx.progress, ctx.verbose, opts->zip_file);
+        int close_result = zip_close_with_progress(ctx.archive, &ctx.progress, ctx.verbose && !use_tui, opts->zip_file);
         if (close_result < 0) {
             fprintf(stderr, "\nError closing ZIP file: %s\n", zip_strerror(ctx.archive));
             result = EXIT_ZIP_ERROR;
         } else {
             time_t elapsed = time(NULL) - ctx.progress.start_time;
-            log_archive_info(opts->zip_file, added_count, total_bytes, (double)elapsed);
             
-            if (!g_log_config.structured) {
+            // Get actual compressed size from file and show TUI summary
+            if (use_tui) {
+                g_tui.compressed_bytes = get_file_size(opts->zip_file);
+                tui_show_summary();
+            } else {
+                // Only show text-based log when TUI is not active
+                log_archive_info(opts->zip_file, added_count, total_bytes, (double)elapsed);
+            }
+            
+            if (!g_log_config.structured && !use_tui) {
                 if (ctx.verbose) {
                     printf(" done\n");
                 }
@@ -773,6 +877,9 @@ int create_zip(const options_t* opts) {
     }
     
     // Cleanup
+    if (use_tui) {
+        tui_cleanup();
+    }
     if (pool) pool_destroy(pool);
     queue_free(&file_queue);
     free_zipignore(&ctx.zipignore);
@@ -888,14 +995,21 @@ int zip_close_with_progress(zip_t* archive, progress_t* progress, bool verbose, 
         time_t end_compression = time(NULL);
         long compression_time = end_compression - start_compression;
         
-        if (result == 0) {
-            printf("\rCompressing and writing archive ✓ (100.0%%) - completed in %lds", compression_time);
-            if (compression_time > 10) {
-                printf("\n  Large file compression required extended time");
+        // Only print text output if TUI is not active
+        if (!g_tui.is_active) {
+            if (result == 0) {
+                printf("\rCompressing and writing archive ✓ (100.0%%) - completed in %lds", compression_time);
+                if (compression_time > 10) {
+                    printf("\n  Large file compression required extended time");
+                }
+                printf("\n");
+            } else {
+                printf("\rCompression failed after %lds\n", compression_time);
             }
-            printf("\n");
         } else {
-            printf("\rCompression failed after %lds\n", compression_time);
+            // Update TUI with 100% completion
+            tui_update_compression(100.0, 0);
+            tui_refresh();
         }
         
         // Clear the filename
@@ -1116,11 +1230,14 @@ int add_file_to_zip(zip_context_t* ctx, const char* file_path, const char* archi
         zip_file_set_mtime(ctx->archive, idx, mtime, 0);
     }
     
-    off_t file_size = get_file_size(file_path);
-    if (file_size > 10 * 1024 * 1024) { // Files larger than 10MB
-        log_file_operation("Added large file", archive_path, file_size);
-    } else {
-        log_file_operation("Added file", archive_path, file_size);
+    // Only log when TUI is not active (TUI handles its own progress display)
+    if (!g_tui.is_active) {
+        off_t file_size = get_file_size(file_path);
+        if (file_size > 10 * 1024 * 1024) { // Files larger than 10MB
+            log_file_operation("Added large file", archive_path, file_size);
+        } else {
+            log_file_operation("Added file", archive_path, file_size);
+        }
     }
     
     return EXIT_SUCCESS;

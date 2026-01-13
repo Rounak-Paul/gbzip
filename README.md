@@ -114,12 +114,12 @@ This allows fine-grained control over what gets included in different parts of y
 
 ## Progress Reporting
 
-For large files, use verbose mode to see real-time progress:
+gbzip automatically shows a real-time TUI with progress bars when creating archives:
 ```bash
-gbzip -v dataset.zip large_directory/
+gbzip dataset.zip large_directory/
 ```
 
-Shows file processing progress followed by compression progress with transfer speeds.
+Use `-q` to disable the TUI for quiet operation.
 
 ## Multithreaded Compression
 
@@ -178,8 +178,7 @@ Basic protections against common archive vulnerabilities:
 
 ## Options
 
-- `-v` verbose output with progress
-- `-q` quiet operation
+- `-q` quiet operation (no TUI)
 - `-s` structured JSON output
 - `-D` differential update
 - `-I <file>` custom ignore patterns

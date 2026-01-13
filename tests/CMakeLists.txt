@@ -7,6 +7,7 @@ set(TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/zip.c
     ${CMAKE_SOURCE_DIR}/src/diff.c
     ${CMAKE_SOURCE_DIR}/src/logging.c
+    ${CMAKE_SOURCE_DIR}/src/tui.c
 )
 
 # Add a simple test
