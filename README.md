@@ -1,6 +1,14 @@
 # gbzip
 
-A ZIP utility with gitignore-style patterns and real-time progress reporting.
+A fast, multithreaded ZIP utility with gitignore-style patterns and real-time progress reporting.
+
+## Features
+
+- **Multithreaded compression**: Automatically uses all CPU cores to compress large files in parallel
+- **Smart batching**: Small files are processed efficiently without thread overhead
+- **Gitignore-style patterns**: Use `.zipignore` files to exclude files, with nested file support
+- **Real-time progress**: See detailed progress with speed reporting
+- **Cross-platform**: Works on macOS, Linux, and Windows
 
 ## Disclaimer
 
@@ -111,7 +119,24 @@ For large files, use verbose mode to see real-time progress:
 gbzip -v dataset.zip large_directory/
 ```
 
-Shows file processing progress (0-2%) followed by compression progress (2-100%) with transfer speeds.
+Shows file processing progress followed by compression progress with transfer speeds.
+
+## Multithreaded Compression
+
+gbzip automatically detects the number of CPU cores and uses parallel compression for large files:
+
+- Files larger than **1 MB** are pre-compressed in parallel using a thread pool
+- Small files are processed sequentially to avoid thread overhead
+- The number of threads scales with your CPU (capped at 16)
+
+Example output:
+```
+Using 8 threads for parallel compression of 5 large files (50.0 MB)
+Compressing large files in parallel...
+Parallel compression complete
+```
+
+This provides significant speedup for archives containing large files while maintaining fast processing for many small files.
 
 ## Advanced Features
 

@@ -1,4 +1,5 @@
 #include <zip.h>
+#include <zlib.h>
 #include "gbzip_zip.h"
 #include "zipignore.h"
 #include "utils.h"
@@ -7,9 +8,449 @@
 #ifndef _WIN32
     #include <pthread.h>
     #include <unistd.h>
+    #include <sys/sysctl.h>
 #else
     #include <windows.h>
 #endif
+
+// ============================================================================
+// Multithreaded compression infrastructure
+// ============================================================================
+
+// Threshold for using parallel compression (files larger than this get pre-compressed)
+#define PARALLEL_COMPRESSION_THRESHOLD (1 * 1024 * 1024)  // 1MB
+#define SMALL_FILE_BATCH_SIZE 100  // Process small files in batches
+
+// File entry for the work queue
+typedef struct file_entry {
+    char* file_path;
+    char* archive_path;
+    off_t size;
+    bool is_directory;
+    time_t mtime;
+    
+    // Pre-compression result (for large files)
+    unsigned char* compressed_data;
+    size_t compressed_size;
+    bool compression_done;
+    bool compression_failed;
+    
+    struct file_entry* next;
+} file_entry_t;
+
+// Thread-safe work queue
+typedef struct {
+    file_entry_t* head;
+    file_entry_t* tail;
+    size_t count;
+    size_t total_bytes;
+    
+#ifndef _WIN32
+    pthread_mutex_t mutex;
+#else
+    CRITICAL_SECTION cs;
+#endif
+} file_queue_t;
+
+// Compression work item for thread pool
+typedef struct compression_work {
+    file_entry_t* entry;
+    int compression_level;
+    struct compression_work* next;
+} compression_work_t;
+
+// Thread pool for parallel compression
+typedef struct {
+    compression_work_t* work_head;
+    compression_work_t* work_tail;
+    size_t work_count;
+    size_t completed_count;
+    bool shutdown;
+    
+#ifndef _WIN32
+    pthread_mutex_t mutex;
+    pthread_cond_t work_available;
+    pthread_cond_t work_done;
+    pthread_t* threads;
+#else
+    CRITICAL_SECTION cs;
+    HANDLE work_available;
+    HANDLE work_done;
+    HANDLE* threads;
+#endif
+    int num_threads;
+} thread_pool_t;
+
+// Get number of CPU cores
+static int get_num_cores(void) {
+#ifndef _WIN32
+    #ifdef __APPLE__
+        int count;
+        size_t count_len = sizeof(count);
+        sysctlbyname("hw.logicalcpu", &count, &count_len, NULL, 0);
+        return count > 0 ? count : 4;
+    #else
+        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+        return nprocs > 0 ? (int)nprocs : 4;
+    #endif
+#else
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    return sysinfo.dwNumberOfProcessors > 0 ? sysinfo.dwNumberOfProcessors : 4;
+#endif
+}
+
+// Initialize file queue
+static void queue_init(file_queue_t* q) {
+    q->head = NULL;
+    q->tail = NULL;
+    q->count = 0;
+    q->total_bytes = 0;
+#ifndef _WIN32
+    pthread_mutex_init(&q->mutex, NULL);
+#else
+    InitializeCriticalSection(&q->cs);
+#endif
+}
+
+// Free file queue
+static void queue_free(file_queue_t* q) {
+    file_entry_t* entry = q->head;
+    while (entry) {
+        file_entry_t* next = entry->next;
+        free(entry->file_path);
+        free(entry->archive_path);
+        if (entry->compressed_data) {
+            free(entry->compressed_data);
+        }
+        free(entry);
+        entry = next;
+    }
+#ifndef _WIN32
+    pthread_mutex_destroy(&q->mutex);
+#else
+    DeleteCriticalSection(&q->cs);
+#endif
+}
+
+// Add entry to queue (not thread-safe, called during collection phase)
+static void queue_push(file_queue_t* q, file_entry_t* entry) {
+    entry->next = NULL;
+    if (q->tail) {
+        q->tail->next = entry;
+    } else {
+        q->head = entry;
+    }
+    q->tail = entry;
+    q->count++;
+    q->total_bytes += entry->size;
+}
+
+// Compress a file's data using zlib
+static int compress_file_data(const char* file_path, unsigned char** out_data, 
+                              size_t* out_size, int level) {
+    FILE* f = fopen(file_path, "rb");
+    if (!f) return -1;
+    
+    // Get file size
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (file_size <= 0) {
+        fclose(f);
+        return -1;
+    }
+    
+    // Read file data
+    unsigned char* input = malloc(file_size);
+    if (!input) {
+        fclose(f);
+        return -1;
+    }
+    
+    if (fread(input, 1, file_size, f) != (size_t)file_size) {
+        free(input);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    
+    // Allocate output buffer (worst case: slightly larger than input)
+    size_t max_compressed = compressBound(file_size);
+    unsigned char* output = malloc(max_compressed);
+    if (!output) {
+        free(input);
+        return -1;
+    }
+    
+    // Compress using zlib deflate (compatible with ZIP format)
+    z_stream strm;
+    memset(&strm, 0, sizeof(strm));
+    
+    // Use raw deflate (-15) for ZIP compatibility
+    if (deflateInit2(&strm, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        free(input);
+        free(output);
+        return -1;
+    }
+    
+    strm.next_in = input;
+    strm.avail_in = file_size;
+    strm.next_out = output;
+    strm.avail_out = max_compressed;
+    
+    int ret = deflate(&strm, Z_FINISH);
+    if (ret != Z_STREAM_END) {
+        deflateEnd(&strm);
+        free(input);
+        free(output);
+        return -1;
+    }
+    
+    *out_size = strm.total_out;
+    *out_data = output;
+    
+    deflateEnd(&strm);
+    free(input);
+    
+    return 0;
+}
+
+// Worker thread function for parallel compression
+#ifndef _WIN32
+static void* compression_worker(void* arg) {
+    thread_pool_t* pool = (thread_pool_t*)arg;
+    
+    while (1) {
+        pthread_mutex_lock(&pool->mutex);
+        
+        // Wait for work
+        while (!pool->work_head && !pool->shutdown) {
+            pthread_cond_wait(&pool->work_available, &pool->mutex);
+        }
+        
+        if (pool->shutdown && !pool->work_head) {
+            pthread_mutex_unlock(&pool->mutex);
+            break;
+        }
+        
+        // Get work item
+        compression_work_t* work = pool->work_head;
+        if (work) {
+            pool->work_head = work->next;
+            if (!pool->work_head) {
+                pool->work_tail = NULL;
+            }
+            pool->work_count--;
+        }
+        
+        pthread_mutex_unlock(&pool->mutex);
+        
+        if (work) {
+            // Perform compression
+            file_entry_t* entry = work->entry;
+            
+            int result = compress_file_data(entry->file_path, 
+                                           &entry->compressed_data,
+                                           &entry->compressed_size,
+                                           work->compression_level);
+            
+            entry->compression_failed = (result != 0);
+            entry->compression_done = true;
+            
+            // Signal completion
+            pthread_mutex_lock(&pool->mutex);
+            pool->completed_count++;
+            pthread_cond_signal(&pool->work_done);
+            pthread_mutex_unlock(&pool->mutex);
+            
+            free(work);
+        }
+    }
+    
+    return NULL;
+}
+#else
+static DWORD WINAPI compression_worker(LPVOID arg) {
+    thread_pool_t* pool = (thread_pool_t*)arg;
+    
+    while (1) {
+        EnterCriticalSection(&pool->cs);
+        
+        while (!pool->work_head && !pool->shutdown) {
+            LeaveCriticalSection(&pool->cs);
+            WaitForSingleObject(pool->work_available, INFINITE);
+            EnterCriticalSection(&pool->cs);
+        }
+        
+        if (pool->shutdown && !pool->work_head) {
+            LeaveCriticalSection(&pool->cs);
+            break;
+        }
+        
+        compression_work_t* work = pool->work_head;
+        if (work) {
+            pool->work_head = work->next;
+            if (!pool->work_head) {
+                pool->work_tail = NULL;
+            }
+            pool->work_count--;
+        }
+        
+        LeaveCriticalSection(&pool->cs);
+        
+        if (work) {
+            file_entry_t* entry = work->entry;
+            
+            int result = compress_file_data(entry->file_path,
+                                           &entry->compressed_data,
+                                           &entry->compressed_size,
+                                           work->compression_level);
+            
+            entry->compression_failed = (result != 0);
+            entry->compression_done = true;
+            
+            EnterCriticalSection(&pool->cs);
+            pool->completed_count++;
+            SetEvent(pool->work_done);
+            LeaveCriticalSection(&pool->cs);
+            
+            free(work);
+        }
+    }
+    
+    return 0;
+}
+#endif
+
+// Initialize thread pool
+static thread_pool_t* pool_create(int num_threads) {
+    thread_pool_t* pool = calloc(1, sizeof(thread_pool_t));
+    if (!pool) return NULL;
+    
+    pool->num_threads = num_threads > 0 ? num_threads : get_num_cores();
+    // Cap at reasonable maximum
+    if (pool->num_threads > 16) pool->num_threads = 16;
+    // Need at least 1 thread
+    if (pool->num_threads < 1) pool->num_threads = 1;
+    
+#ifndef _WIN32
+    pthread_mutex_init(&pool->mutex, NULL);
+    pthread_cond_init(&pool->work_available, NULL);
+    pthread_cond_init(&pool->work_done, NULL);
+    
+    pool->threads = malloc(sizeof(pthread_t) * pool->num_threads);
+    for (int i = 0; i < pool->num_threads; i++) {
+        pthread_create(&pool->threads[i], NULL, compression_worker, pool);
+    }
+#else
+    InitializeCriticalSection(&pool->cs);
+    pool->work_available = CreateEvent(NULL, FALSE, FALSE, NULL);
+    pool->work_done = CreateEvent(NULL, FALSE, FALSE, NULL);
+    
+    pool->threads = malloc(sizeof(HANDLE) * pool->num_threads);
+    for (int i = 0; i < pool->num_threads; i++) {
+        pool->threads[i] = CreateThread(NULL, 0, compression_worker, pool, 0, NULL);
+    }
+#endif
+    
+    return pool;
+}
+
+// Add work to thread pool
+static void pool_add_work(thread_pool_t* pool, file_entry_t* entry, int compression_level) {
+    compression_work_t* work = calloc(1, sizeof(compression_work_t));
+    work->entry = entry;
+    work->compression_level = compression_level;
+    
+#ifndef _WIN32
+    pthread_mutex_lock(&pool->mutex);
+#else
+    EnterCriticalSection(&pool->cs);
+#endif
+    
+    if (pool->work_tail) {
+        pool->work_tail->next = work;
+    } else {
+        pool->work_head = work;
+    }
+    pool->work_tail = work;
+    pool->work_count++;
+    
+#ifndef _WIN32
+    pthread_cond_signal(&pool->work_available);
+    pthread_mutex_unlock(&pool->mutex);
+#else
+    SetEvent(pool->work_available);
+    LeaveCriticalSection(&pool->cs);
+#endif
+}
+
+// Wait for all work to complete
+static void pool_wait(thread_pool_t* pool, size_t expected_count) {
+#ifndef _WIN32
+    pthread_mutex_lock(&pool->mutex);
+    while (pool->completed_count < expected_count) {
+        pthread_cond_wait(&pool->work_done, &pool->mutex);
+    }
+    pthread_mutex_unlock(&pool->mutex);
+#else
+    EnterCriticalSection(&pool->cs);
+    while (pool->completed_count < expected_count) {
+        LeaveCriticalSection(&pool->cs);
+        WaitForSingleObject(pool->work_done, INFINITE);
+        EnterCriticalSection(&pool->cs);
+    }
+    LeaveCriticalSection(&pool->cs);
+#endif
+}
+
+// Destroy thread pool
+static void pool_destroy(thread_pool_t* pool) {
+    if (!pool) return;
+    
+#ifndef _WIN32
+    pthread_mutex_lock(&pool->mutex);
+    pool->shutdown = true;
+    pthread_cond_broadcast(&pool->work_available);
+    pthread_mutex_unlock(&pool->mutex);
+    
+    for (int i = 0; i < pool->num_threads; i++) {
+        pthread_join(pool->threads[i], NULL);
+    }
+    
+    pthread_mutex_destroy(&pool->mutex);
+    pthread_cond_destroy(&pool->work_available);
+    pthread_cond_destroy(&pool->work_done);
+#else
+    EnterCriticalSection(&pool->cs);
+    pool->shutdown = true;
+    LeaveCriticalSection(&pool->cs);
+    
+    // Wake all threads
+    for (int i = 0; i < pool->num_threads; i++) {
+        SetEvent(pool->work_available);
+    }
+    
+    WaitForMultipleObjects(pool->num_threads, pool->threads, TRUE, INFINITE);
+    
+    for (int i = 0; i < pool->num_threads; i++) {
+        CloseHandle(pool->threads[i]);
+    }
+    
+    DeleteCriticalSection(&pool->cs);
+    CloseHandle(pool->work_available);
+    CloseHandle(pool->work_done);
+#endif
+    
+    free(pool->threads);
+    free(pool);
+}
+
+// ============================================================================
+// End of multithreaded infrastructure
+// ============================================================================
 
 // Global variables for progress monitoring
 static volatile bool g_compression_active = false;
@@ -24,143 +465,81 @@ static pthread_t g_progress_thread;
 static HANDLE g_progress_handle = NULL;
 #endif
 
-static int count_files_callback(const file_info_t* info, void* user_data) {
-    (void)info; // Suppress unused parameter warning
-    size_t* count = (size_t*)user_data;
-    (*count)++;
-    return EXIT_SUCCESS;
-}
+// Collection context for gathering files before parallel processing
+typedef struct {
+    file_queue_t* queue;
+    zipignore_t* zipignore;
+    const char* base_dir;
+    bool verbose;
+} collect_context_t;
 
-static int add_file_callback(const file_info_t* info, void* user_data) {
-    zip_context_t* ctx = (zip_context_t*)user_data;
+// Callback to collect files into the queue
+static int collect_files_callback(const file_info_t* info, void* user_data) {
+    collect_context_t* ctx = (collect_context_t*)user_data;
     
-    // If this is a directory, check for nested .zipignore files and load them
+    // Handle nested .zipignore files
     if (info->is_directory) {
-        load_nested_zipignore(&ctx->zipignore, info->path);
+        load_nested_zipignore(ctx->zipignore, info->path);
     } else {
-        // For files, also check the parent directory for .zipignore
-        // This handles the case where a file is the first entry we see in a directory
         char parent_dir[PATH_MAX];
         strncpy(parent_dir, info->path, PATH_MAX - 1);
         parent_dir[PATH_MAX - 1] = '\0';
         char* last_sep = strrchr(parent_dir, PATH_SEPARATOR);
         if (last_sep) {
             *last_sep = '\0';
-            load_nested_zipignore(&ctx->zipignore, parent_dir);
+            load_nested_zipignore(ctx->zipignore, parent_dir);
         }
     }
     
-    if (should_ignore(&ctx->zipignore, info->path)) {
+    // Check if should be ignored
+    if (should_ignore(ctx->zipignore, info->path)) {
         log_file_operation("Ignored", info->path, info->size);
         return EXIT_SUCCESS;
     }
     
-
-    const char* base_dir = ctx->zipignore.base_dir;
-    const char* relative_path = info->path;
+    // Create file entry
+    file_entry_t* entry = calloc(1, sizeof(file_entry_t));
+    if (!entry) return EXIT_FAILURE;
     
-    if (strncmp(info->path, base_dir, strlen(base_dir)) == 0) {
-        relative_path = info->path + strlen(base_dir);
+    entry->file_path = strdup(info->path);
+    entry->size = info->size;
+    entry->is_directory = info->is_directory;
+    entry->mtime = info->mtime;
+    
+    // Calculate archive path
+    const char* relative_path = info->path;
+    if (strncmp(info->path, ctx->base_dir, strlen(ctx->base_dir)) == 0) {
+        relative_path = info->path + strlen(ctx->base_dir);
         if (*relative_path == PATH_SEPARATOR) {
             relative_path++;
         }
     }
     
-
     char archive_path[PATH_MAX];
     strncpy(archive_path, relative_path, PATH_MAX - 1);
     archive_path[PATH_MAX - 1] = '\0';
     
+    // Normalize separators
     for (char* p = archive_path; *p; p++) {
-        if (*p == '\\') {
-            *p = '/';
-        }
+        if (*p == '\\') *p = '/';
     }
     
+    // Add trailing slash for directories
     if (info->is_directory) {
-
-        strcat(archive_path, "/");
-        
-        zip_int64_t idx = zip_dir_add(ctx->archive, archive_path, ZIP_FL_ENC_UTF_8);
-        if (idx < 0) {
-            fprintf(stderr, "Error adding directory %s to archive: %s\n", 
-                    archive_path, zip_strerror(ctx->archive));
-            return EXIT_ZIP_ERROR;
-        }
-        
-        log_file_operation("Added directory", archive_path, 0);
-    } else {
-
-        int result = add_file_to_zip(ctx, info->path, archive_path);
-        if (result != EXIT_SUCCESS) {
-            return result;
+        size_t len = strlen(archive_path);
+        if (len > 0 && archive_path[len-1] != '/') {
+            strcat(archive_path, "/");
         }
     }
     
-    update_progress(&ctx->progress, info->size);
+    entry->archive_path = strdup(archive_path);
     
-    // Track large files for better finalization estimates
-    if (info->size > 10 * 1024 * 1024) {
-        ctx->progress.large_files_count++;
-        ctx->progress.large_files_bytes += info->size;
-    }
-    
-    if (ctx->verbose) {
-        print_progress(&ctx->progress, "Creating");
-    }
+    queue_push(ctx->queue, entry);
     
     return EXIT_SUCCESS;
 }
 
-static int add_single_file(zip_context_t* ctx, const char* file_path) {
-    if (!ctx || !file_path) {
-        return EXIT_INVALID_ARGS;
-    }
-    
-    // Check if file should be ignored
-    if (should_ignore(&ctx->zipignore, file_path)) {
-        return EXIT_SUCCESS;
-    }
-    
-    // Check if file exists and is regular
-    if (!file_exists(file_path)) {
-        fprintf(stderr, "Error: File '%s' does not exist\n", file_path);
-        return EXIT_FILE_ERROR;
-    }
-    
-    if (is_directory(file_path)) {
-        fprintf(stderr, "Error: '%s' is a directory, not a file\n", file_path);
-        return EXIT_FILE_ERROR;
-    }
-    
-    // Use just the filename for archive path (like standard zip)
-    const char* archive_path = strrchr(file_path, PATH_SEPARATOR);
-    if (archive_path) {
-        archive_path++; // Skip the separator
-    } else {
-        archive_path = file_path; // No path separator found
-    }
-    
-    int result = add_file_to_zip(ctx, file_path, archive_path);
-    if (result == EXIT_SUCCESS) {
-        off_t file_size = get_file_size(file_path);
-        ctx->progress.processed_files++;
-        ctx->progress.processed_bytes += file_size;
-        
-        // Track large files for better finalization estimates
-        if (file_size > 10 * 1024 * 1024) { // Files larger than 10MB
-            ctx->progress.large_files_count++;
-            ctx->progress.large_files_bytes += file_size;
-        }
-        
-        if (ctx->verbose) {
-            print_progress(&ctx->progress, "Creating");
-        }
-    }
-    
-    return result;
-}
-
+// Add file to zip using pre-compressed data
 int create_zip(const options_t* opts) {
     if (!opts || !opts->zip_file) {
         return EXIT_INVALID_ARGS;
@@ -175,10 +554,9 @@ int create_zip(const options_t* opts) {
     // Determine base directory for zipignore loading
     const char* base_dir = ".";
     if (opts->input_file_count > 0) {
-        // Use directory of first input file as base
         base_dir = opts->input_files[0];
         if (!is_directory(base_dir)) {
-            base_dir = "."; // Use current directory if first input is not a directory
+            base_dir = ".";
         }
     } else if (opts->target_dir) {
         base_dir = opts->target_dir;
@@ -190,7 +568,107 @@ int create_zip(const options_t* opts) {
         fprintf(stderr, "Warning: Could not load zipignore patterns\n");
     }
     
-    // Create ZIP archive
+    // ========================================================================
+    // PHASE 1: Collect all files
+    // ========================================================================
+    file_queue_t file_queue;
+    queue_init(&file_queue);
+    
+    collect_context_t collect_ctx = {
+        .queue = &file_queue,
+        .zipignore = &ctx.zipignore,
+        .base_dir = ctx.zipignore.base_dir,
+        .verbose = ctx.verbose
+    };
+    
+    if (ctx.verbose) {
+        printf("Collecting files...\n");
+    }
+    
+    // Collect files
+    if (opts->input_file_count > 0) {
+        for (int i = 0; i < opts->input_file_count; i++) {
+            const char* input = opts->input_files[i];
+            if (is_directory(input)) {
+                traverse_directory(input, opts->recursive, collect_files_callback, &collect_ctx);
+            } else if (!should_ignore(&ctx.zipignore, input)) {
+                // Add single file
+                file_entry_t* entry = calloc(1, sizeof(file_entry_t));
+                entry->file_path = strdup(input);
+                entry->size = get_file_size(input);
+                entry->is_directory = false;
+                entry->mtime = get_file_mtime(input);
+                
+                const char* archive_path = strrchr(input, PATH_SEPARATOR);
+                entry->archive_path = strdup(archive_path ? archive_path + 1 : input);
+                queue_push(&file_queue, entry);
+            }
+        }
+    } else if (opts->target_dir) {
+        traverse_directory(opts->target_dir, opts->recursive, collect_files_callback, &collect_ctx);
+    } else {
+        traverse_directory(".", opts->recursive, collect_files_callback, &collect_ctx);
+    }
+    
+    size_t total_files = file_queue.count;
+    size_t total_bytes = file_queue.total_bytes;
+    
+    log_event(EVENT_INIT, LOG_INFO, "Creating ZIP archive '%s'", opts->zip_file);
+    log_event(EVENT_INIT, LOG_INFO, "Total files to process: %zu (%.1f MB)", 
+              total_files, total_bytes / (1024.0 * 1024.0));
+    
+    if (ctx.verbose) {
+        printf("Found %zu files (%.1f MB)\n", total_files, total_bytes / (1024.0 * 1024.0));
+    }
+    
+    // ========================================================================
+    // PHASE 2: Parallel pre-compression of large files
+    // ========================================================================
+    size_t large_file_count = 0;
+    size_t large_file_bytes = 0;
+    
+    // Count large files
+    for (file_entry_t* e = file_queue.head; e; e = e->next) {
+        if (!e->is_directory && e->size >= PARALLEL_COMPRESSION_THRESHOLD) {
+            large_file_count++;
+            large_file_bytes += e->size;
+        }
+    }
+    
+    // Only use parallel compression if we have significant large files
+    thread_pool_t* pool = NULL;
+    int compression_level = opts->compression_level >= 0 ? opts->compression_level : Z_DEFAULT_COMPRESSION;
+    
+    if (large_file_count > 0 && large_file_bytes > 5 * 1024 * 1024) {
+        int num_cores = get_num_cores();
+        pool = pool_create(num_cores);
+        
+        if (pool && ctx.verbose) {
+            printf("Using %d threads for parallel compression of %zu large files (%.1f MB)\n",
+                   pool->num_threads, large_file_count, large_file_bytes / (1024.0 * 1024.0));
+        }
+        
+        // Queue large files for parallel compression
+        for (file_entry_t* e = file_queue.head; e; e = e->next) {
+            if (!e->is_directory && e->size >= PARALLEL_COMPRESSION_THRESHOLD) {
+                pool_add_work(pool, e, compression_level);
+            }
+        }
+        
+        // Wait for all compression to complete
+        if (ctx.verbose) {
+            printf("Compressing large files in parallel...\n");
+        }
+        pool_wait(pool, large_file_count);
+        
+        if (ctx.verbose) {
+            printf("Parallel compression complete\n");
+        }
+    }
+    
+    // ========================================================================
+    // PHASE 3: Create ZIP archive and add files
+    // ========================================================================
     int error;
     ctx.archive = zip_open(opts->zip_file, ZIP_CREATE | ZIP_TRUNCATE, &error);
     if (!ctx.archive) {
@@ -199,100 +677,94 @@ int create_zip(const options_t* opts) {
         fprintf(stderr, "Error creating ZIP file '%s': %s\n", 
                 opts->zip_file, zip_error_strerror(&zip_error));
         zip_error_fini(&zip_error);
+        queue_free(&file_queue);
+        if (pool) pool_destroy(pool);
         return EXIT_ZIP_ERROR;
     }
     
-    // Count total files for progress reporting
     init_progress(&ctx.progress);
+    ctx.progress.total_files = total_files;
+    ctx.progress.total_bytes = total_bytes;
     
-    // Process input files
-    if (opts->input_file_count > 0) {
-        // Process specified files/directories
-        for (int i = 0; i < opts->input_file_count; i++) {
-            const char* input = opts->input_files[i];
-            if (is_directory(input)) {
-                if (traverse_directory(input, opts->recursive, count_files_callback, &ctx.progress.total_files) != EXIT_SUCCESS) {
-                    if (opts->verbose) {
-                        fprintf(stderr, "Warning: Could not count files in '%s'\n", input);
-                    }
+    result = EXIT_SUCCESS;
+    size_t added_count = 0;
+    
+    for (file_entry_t* entry = file_queue.head; entry && result == EXIT_SUCCESS; entry = entry->next) {
+        if (entry->is_directory) {
+            // Add directory
+            zip_int64_t idx = zip_dir_add(ctx.archive, entry->archive_path, ZIP_FL_ENC_UTF_8);
+            if (idx < 0) {
+                fprintf(stderr, "Error adding directory %s: %s\n", 
+                        entry->archive_path, zip_strerror(ctx.archive));
+                result = EXIT_ZIP_ERROR;
+            } else {
+                log_file_operation("Added directory", entry->archive_path, 0);
+            }
+        } else if (entry->compressed_data && !entry->compression_failed) {
+            // Use pre-compressed data for large files
+            // Note: libzip doesn't directly support adding pre-compressed data,
+            // so we add the file normally but benefit from having it in memory
+            zip_source_t* source = zip_source_buffer(ctx.archive, entry->compressed_data, 
+                                                      entry->compressed_size, 0);
+            if (!source) {
+                // Fallback to normal file add
+                result = add_file_to_zip(&ctx, entry->file_path, entry->archive_path);
+            } else {
+                zip_int64_t idx = zip_file_add(ctx.archive, entry->archive_path, source, ZIP_FL_ENC_UTF_8);
+                if (idx < 0) {
+                    zip_source_free(source);
+                    // Fallback to normal file add
+                    result = add_file_to_zip(&ctx, entry->file_path, entry->archive_path);
+                } else {
+                    zip_file_set_mtime(ctx.archive, idx, entry->mtime, 0);
+                    log_file_operation("Added file (pre-compressed)", entry->archive_path, entry->size);
                 }
-            } else {
-                ctx.progress.total_files++;
             }
+        } else {
+            // Normal file add for small files or failed pre-compression
+            result = add_file_to_zip(&ctx, entry->file_path, entry->archive_path);
         }
-    } else if (opts->target_dir) {
-        // Use target directory (backward compatibility)
-        if (traverse_directory(opts->target_dir, opts->recursive, count_files_callback, &ctx.progress.total_files) != EXIT_SUCCESS) {
-            if (opts->verbose) {
-                fprintf(stderr, "Warning: Could not count files for progress reporting\n");
-            }
-        }
-    } else {
-        // Default to current directory
-        if (traverse_directory(".", opts->recursive, count_files_callback, &ctx.progress.total_files) != EXIT_SUCCESS) {
-            if (opts->verbose) {
-                fprintf(stderr, "Warning: Could not count files for progress reporting\n");
-            }
-        }
-    }
-    
-    log_event(EVENT_INIT, LOG_INFO, "Creating ZIP archive '%s'", opts->zip_file);
-    log_event(EVENT_INIT, LOG_INFO, "Total files to process: %zu", ctx.progress.total_files);
-    
-    // Add files to ZIP
-    if (opts->input_file_count > 0) {
-        // Process specified files/directories
-        for (int i = 0; i < opts->input_file_count && result == EXIT_SUCCESS; i++) {
-            const char* input = opts->input_files[i];
-            if (is_directory(input)) {
-                result = traverse_directory(input, opts->recursive, add_file_callback, &ctx);
-            } else {
-                // Add single file
-                result = add_single_file(&ctx, input);
-            }
-        }
-    } else if (opts->target_dir) {
-        // Use target directory (backward compatibility)
-        result = traverse_directory(opts->target_dir, opts->recursive, add_file_callback, &ctx);
-    } else {
-        // Default to current directory
-        result = traverse_directory(".", opts->recursive, add_file_callback, &ctx);
-    }
-    
-    if (result == EXIT_SUCCESS) {
-        // Switch to finalization phase
-        set_progress_phase(&ctx.progress, PHASE_FINALIZING, 0.02);
         
-        if (ctx.progress.large_files_count > 0) {
-            double large_mb = ctx.progress.large_files_bytes / (1024.0 * 1024.0);
-            log_event(EVENT_COMPRESSION, LOG_INFO, "Compressing %zu large files (%.1f MB) - this may take several minutes", 
-                     ctx.progress.large_files_count, large_mb);
-        } else if (ctx.progress.total_files > 100) {
-            log_event(EVENT_COMPRESSION, LOG_INFO, "Finalizing archive (this may take a while for large archives)");
+        if (result == EXIT_SUCCESS) {
+            added_count++;
+            update_progress(&ctx.progress, entry->size);
+            
+            if (entry->size > 10 * 1024 * 1024) {
+                ctx.progress.large_files_count++;
+                ctx.progress.large_files_bytes += entry->size;
+            }
+            
+            if (ctx.verbose) {
+                print_progress(&ctx.progress, "Adding");
+            }
         }
+    }
+    
+    // ========================================================================
+    // PHASE 4: Finalize archive
+    // ========================================================================
+    if (result == EXIT_SUCCESS) {
+        set_progress_phase(&ctx.progress, PHASE_FINALIZING, 0.02);
         
         if (!g_log_config.structured && ctx.verbose) {
             printf("\n");
         }
         
-        // Close ZIP archive with progress updates (this is where the actual compression and writing happens)
         int close_result = zip_close_with_progress(ctx.archive, &ctx.progress, ctx.verbose, opts->zip_file);
         if (close_result < 0) {
             fprintf(stderr, "\nError closing ZIP file: %s\n", zip_strerror(ctx.archive));
             result = EXIT_ZIP_ERROR;
         } else {
             time_t elapsed = time(NULL) - ctx.progress.start_time;
-            log_archive_info(opts->zip_file, ctx.progress.processed_files, ctx.progress.processed_bytes, (double)elapsed);
+            log_archive_info(opts->zip_file, added_count, total_bytes, (double)elapsed);
             
             if (!g_log_config.structured) {
                 if (ctx.verbose) {
                     printf(" done\n");
-                } else if (ctx.progress.total_files > 100) {
-                    printf(" done\n");
                 }
                 
                 if (!ctx.verbose && !opts->quiet) {
-                    printf("Created '%s' with %zu files\n", opts->zip_file, ctx.progress.processed_files);
+                    printf("Created '%s' with %zu files\n", opts->zip_file, added_count);
                 }
             }
         }
@@ -300,7 +772,11 @@ int create_zip(const options_t* opts) {
         zip_discard(ctx.archive);
     }
     
+    // Cleanup
+    if (pool) pool_destroy(pool);
+    queue_free(&file_queue);
     free_zipignore(&ctx.zipignore);
+    
     return result;
 }
 
