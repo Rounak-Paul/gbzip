@@ -450,41 +450,43 @@ int test_zipignore_gitignore_compatibility(void) {
         "trailing.txt   \n"
     );
     
-    zipignore_t zi;
-    load_zipignore(&zi, test_dir, NULL);
+    zipignore_t* zi = malloc(sizeof(zipignore_t));
+    if (!zi) return EXIT_FAILURE;
+    load_zipignore(zi, test_dir, NULL);
     
     // Test simple patterns
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/app.log") == true, "*.log matches");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/sub/app.log") == true, "*.log matches in subdir");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/temp.tmp") == true, "*.tmp matches");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/app.log") == true, "*.log matches");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/sub/app.log") == true, "*.log matches in subdir");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/temp.tmp") == true, "*.tmp matches");
     
     // Test directory patterns
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/build/output") == true, "build/ matches");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/__pycache__/cache.pyc") == true, "__pycache__/ matches");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/build/output") == true, "build/ matches");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/__pycache__/cache.pyc") == true, "__pycache__/ matches");
     
     // Test anchored patterns
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/TODO") == true, "/TODO matches at root");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/sub/TODO") == false, "/TODO doesn't match in subdir");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/config.local") == true, "/config.local matches at root");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/TODO") == true, "/TODO matches at root");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/sub/TODO") == false, "/TODO doesn't match in subdir");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/config.local") == true, "/config.local matches at root");
     
     // Test path patterns
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/docs/internal/secret.md") == true, "docs/internal/ matches");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/other/docs/internal/file") == false, "docs/internal/ is anchored");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/docs/internal/secret.md") == true, "docs/internal/ matches");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/other/docs/internal/file") == false, "docs/internal/ is anchored");
     
     // Test double-star patterns
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/secret.key") == true, "**/secret.key at root");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/a/b/c/secret.key") == true, "**/secret.key nested");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/logs/app.log") == true, "logs/** matches");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/logs/2024/01/app.log") == true, "logs/** matches nested");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/secret.key") == true, "**/secret.key at root");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/a/b/c/secret.key") == true, "**/secret.key nested");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/logs/app.log") == true, "logs/** matches");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/logs/2024/01/app.log") == true, "logs/** matches nested");
     
     // Test negation
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/debug.log") == true, "*.log matches debug.log");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/important.log") == false, "!important.log negates");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/debug.log") == true, "*.log matches debug.log");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/important.log") == false, "!important.log negates");
     
     // Test trailing whitespace trimming
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_gitcompat/trailing.txt") == true, "Trailing whitespace trimmed");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_gitcompat/trailing.txt") == true, "Trailing whitespace trimmed");
     
-    free_zipignore(&zi);
+    free_zipignore(zi);
+    free(zi);
     remove_tree(test_dir);
     
     return EXIT_SUCCESS;
@@ -500,24 +502,25 @@ int test_zipignore_load_unload(void) {
     create_test_file("/tmp/gbzip_test_loadunload/.zipignore", "*.log\n");
     
     // Load
-    zipignore_t zi;
-    int result = load_zipignore(&zi, test_dir, NULL);
+    zipignore_t* zi = malloc(sizeof(zipignore_t));
+    int result = load_zipignore(zi, test_dir, NULL);
     TEST_ASSERT(result == EXIT_SUCCESS, "load_zipignore succeeds");
-    TEST_ASSERT(zi.pattern_count == 1, "Pattern count is 1");
-    TEST_ASSERT(should_ignore(&zi, "/tmp/gbzip_test_loadunload/test.log") == true, "Pattern works after load");
+    TEST_ASSERT(zi->pattern_count == 1, "Pattern count is 1");
+    TEST_ASSERT(should_ignore(zi, "/tmp/gbzip_test_loadunload/test.log") == true, "Pattern works after load");
     
     // Free
-    free_zipignore(&zi);
-    TEST_ASSERT(zi.pattern_count == 0, "Pattern count is 0 after free");
+    free_zipignore(zi);
+    TEST_ASSERT(zi->pattern_count == 0, "Pattern count is 0 after free");
     
     // Load with no .zipignore file
     remove_tree(test_dir);
     mkdir_p(test_dir);
-    result = load_zipignore(&zi, test_dir, NULL);
+    result = load_zipignore(zi, test_dir, NULL);
     TEST_ASSERT(result == EXIT_SUCCESS, "load_zipignore succeeds without .zipignore file");
-    TEST_ASSERT(zi.pattern_count == 0, "No patterns loaded when no .zipignore");
+    TEST_ASSERT(zi->pattern_count == 0, "No patterns loaded when no .zipignore");
     
-    free_zipignore(&zi);
+    free_zipignore(zi);
+    free(zi);
     remove_tree(test_dir);
     
     return EXIT_SUCCESS;
@@ -534,28 +537,29 @@ int test_zipignore_duplicate_load_prevention(void) {
     create_test_file("/tmp/gbzip_test_dupload/.zipignore", "*.log\n");
     create_test_file("/tmp/gbzip_test_dupload/sub/.zipignore", "*.bak\n");
     
-    zipignore_t zi;
-    load_zipignore(&zi, test_dir, NULL);
-    TEST_ASSERT(zi.pattern_count == 1, "Initial pattern count is 1");
-    TEST_ASSERT(zi.loaded_files_count == 1, "Initial loaded files count is 1");
+    zipignore_t* zi = malloc(sizeof(zipignore_t));
+    load_zipignore(zi, test_dir, NULL);
+    TEST_ASSERT(zi->pattern_count == 1, "Initial pattern count is 1");
+    TEST_ASSERT(zi->loaded_files_count == 1, "Initial loaded files count is 1");
     
     // Load nested
-    load_nested_zipignore(&zi, "/tmp/gbzip_test_dupload/sub");
-    TEST_ASSERT(zi.pattern_count == 2, "Pattern count is 2 after nested load");
-    TEST_ASSERT(zi.loaded_files_count == 2, "Loaded files count is 2");
+    load_nested_zipignore(zi, "/tmp/gbzip_test_dupload/sub");
+    TEST_ASSERT(zi->pattern_count == 2, "Pattern count is 2 after nested load");
+    TEST_ASSERT(zi->loaded_files_count == 2, "Loaded files count is 2");
     
     // Try to load same files again - should not duplicate
-    load_nested_zipignore(&zi, "/tmp/gbzip_test_dupload");
-    load_nested_zipignore(&zi, "/tmp/gbzip_test_dupload/sub");
-    TEST_ASSERT(zi.pattern_count == 2, "Pattern count unchanged after duplicate load attempt");
-    TEST_ASSERT(zi.loaded_files_count == 2, "Loaded files count unchanged");
+    load_nested_zipignore(zi, "/tmp/gbzip_test_dupload");
+    load_nested_zipignore(zi, "/tmp/gbzip_test_dupload/sub");
+    TEST_ASSERT(zi->pattern_count == 2, "Pattern count unchanged after duplicate load attempt");
+    TEST_ASSERT(zi->loaded_files_count == 2, "Loaded files count unchanged");
     
     // Test is_zipignore_loaded
-    TEST_ASSERT(is_zipignore_loaded(&zi, "/tmp/gbzip_test_dupload/.zipignore") == true, "Root .zipignore is marked as loaded");
-    TEST_ASSERT(is_zipignore_loaded(&zi, "/tmp/gbzip_test_dupload/sub/.zipignore") == true, "Sub .zipignore is marked as loaded");
-    TEST_ASSERT(is_zipignore_loaded(&zi, "/tmp/gbzip_test_dupload/nonexistent/.zipignore") == false, "Nonexistent .zipignore not marked as loaded");
+    TEST_ASSERT(is_zipignore_loaded(zi, "/tmp/gbzip_test_dupload/.zipignore") == true, "Root .zipignore is marked as loaded");
+    TEST_ASSERT(is_zipignore_loaded(zi, "/tmp/gbzip_test_dupload/sub/.zipignore") == true, "Sub .zipignore is marked as loaded");
+    TEST_ASSERT(is_zipignore_loaded(zi, "/tmp/gbzip_test_dupload/nonexistent/.zipignore") == false, "Nonexistent .zipignore not marked as loaded");
     
-    free_zipignore(&zi);
+    free_zipignore(zi);
+    free(zi);
     remove_tree(test_dir);
     
     return EXIT_SUCCESS;
@@ -620,9 +624,7 @@ int main(void) {
     test_zipignore_negation();
     test_zipignore_nested_files();
     test_zipignore_deeply_nested();
-    printf("DEBUG: After deeply_nested, before edge_cases\n"); fflush(stdout);
     test_zipignore_edge_cases();
-    printf("DEBUG: After edge_cases\n"); fflush(stdout);
     test_zipignore_gitignore_compatibility();
     test_zipignore_load_unload();
     test_zipignore_duplicate_load_prevention();

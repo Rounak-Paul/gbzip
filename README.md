@@ -19,6 +19,7 @@ git clone https://github.com/yourusername/gbzip.git
 cd gbzip
 mkdir build && cd build
 cmake .. && make
+sudo make install
 ```
 
 Requires CMake and libzip. On macOS: `brew install libzip`. On Ubuntu/Debian: `apt install libzip-dev`.
@@ -59,15 +60,49 @@ gbzip -l archive.zip
 Create a `.zipignore` file to exclude files during archiving:
 
 ```
-build/
+# Basic patterns
+*.log
 *.tmp
-.git/
+.DS_Store
+
+# Directory patterns (trailing slash)
+build/
 node_modules/
+.git/
 venv/
+
+# Anchored patterns (leading slash - relative to .zipignore location)
+/TODO
+/config.local
+
+# Double-star patterns (match across directories)
+**/secret.key
+logs/**
+
+# Negation (include previously ignored files)
+*.log
 !important.log
+
+# Character classes
+file[0-9].txt
 ```
 
-Uses gitignore syntax. Patterns are processed during directory traversal for efficiency.
+### Nested `.zipignore` Files
+
+Like `.gitignore`, you can place `.zipignore` files at any directory depth. Patterns in each file only apply to files within that directory and its subdirectories:
+
+```
+project/
+├── .zipignore          # *.log applies to entire project
+├── src/
+│   ├── .zipignore      # *.bak applies only within src/
+│   └── main.c
+└── docs/
+    ├── .zipignore      # draft* applies only within docs/
+    └── readme.md
+```
+
+This allows fine-grained control over what gets included in different parts of your project.
 
 ## Progress Reporting
 
