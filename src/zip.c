@@ -34,6 +34,22 @@ static int count_files_callback(const file_info_t* info, void* user_data) {
 static int add_file_callback(const file_info_t* info, void* user_data) {
     zip_context_t* ctx = (zip_context_t*)user_data;
     
+    // If this is a directory, check for nested .zipignore files and load them
+    if (info->is_directory) {
+        load_nested_zipignore(&ctx->zipignore, info->path);
+    } else {
+        // For files, also check the parent directory for .zipignore
+        // This handles the case where a file is the first entry we see in a directory
+        char parent_dir[PATH_MAX];
+        strncpy(parent_dir, info->path, PATH_MAX - 1);
+        parent_dir[PATH_MAX - 1] = '\0';
+        char* last_sep = strrchr(parent_dir, PATH_SEPARATOR);
+        if (last_sep) {
+            *last_sep = '\0';
+            load_nested_zipignore(&ctx->zipignore, parent_dir);
+        }
+    }
+    
     if (should_ignore(&ctx->zipignore, info->path)) {
         log_file_operation("Ignored", info->path, info->size);
         return EXIT_SUCCESS;
