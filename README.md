@@ -65,7 +65,60 @@ gbzip -l archive.zip
 
 ## Ignore Patterns
 
-Create a `.zipignore` file to exclude files during archiving:
+gbzip uses a hierarchical `.zipignore` system that works like `.gitignore`. Patterns can be defined at multiple levels:
+
+1. **Global patterns** in `~/.zipignore` (your home directory)
+2. **Project patterns** in the root `.zipignore` of your project
+3. **Directory-specific patterns** in `.zipignore` files within subdirectories
+
+### Pattern Hierarchy
+
+Patterns are loaded in order, with later patterns able to override earlier ones:
+
+```
+~/.zipignore              ← Global defaults (loaded first)
+    ↓
+project/.zipignore        ← Project-specific patterns (adds to global)
+    ↓
+project/src/.zipignore    ← Subdirectory patterns (can override parent)
+    ↓
+project/src/lib/.zipignore ← Deeper subdirectories (can override any ancestor)
+```
+
+**Key behavior:**
+- Home `~/.zipignore` applies to ALL projects as a base
+- Local `.zipignore` **adds to** (not replaces) home patterns
+- Subdirectory `.zipignore` files can add new patterns OR negate parent patterns
+- Negation patterns (`!pattern`) work at any level
+
+### Example: Hierarchical Ignore
+
+```
+~/.zipignore (home directory - global defaults):
+*.log
+.DS_Store
+```
+
+```
+project/.zipignore (project root - adds *.tmp):
+*.tmp
+*.bak
+```
+
+```
+project/logs/.zipignore (subdirectory - negates *.log for this folder):
+!*.log
+```
+
+**Result:**
+| File | Included? | Reason |
+|------|-----------|--------|
+| `project/app.log` | ❌ No | Matches `~/.zipignore: *.log` |
+| `project/file.tmp` | ❌ No | Matches `project/.zipignore: *.tmp` |
+| `project/logs/debug.log` | ✅ Yes | Negated by `project/logs/.zipignore: !*.log` |
+| `project/logs/test.tmp` | ❌ No | Still matches `*.tmp` from parent |
+
+### Pattern Syntax
 
 ```
 # Basic patterns
@@ -111,6 +164,34 @@ project/
 ```
 
 This allows fine-grained control over what gets included in different parts of your project.
+
+### Real-World Example
+
+Setting up a global `.zipignore` for common exclusions:
+
+```bash
+# Create global .zipignore in home directory
+cat > ~/.zipignore << 'EOF'
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Common build artifacts
+*.log
+*.tmp
+*.cache
+EOF
+```
+
+Now ALL your gbzip operations will automatically exclude these files. Project-specific `.zipignore` files add additional patterns on top of this base.
 
 ## Progress Reporting
 

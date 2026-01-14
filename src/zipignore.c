@@ -132,35 +132,32 @@ int load_zipignore(zipignore_t* zi, const char* base_dir, const char* zipignore_
     strncpy(zi->base_dir, base_dir, PATH_MAX - 1);
     zi->base_dir[PATH_MAX - 1] = '\0';
     
-    // Determine zipignore file path
     char zipignore_path[PATH_MAX];
-    bool found_zipignore = false;
     
     if (zipignore_file) {
-        strncpy(zipignore_path, zipignore_file, PATH_MAX - 1);
-        found_zipignore = file_exists(zipignore_path);
+        // If a specific zipignore file is provided, use only that
+        if (file_exists(zipignore_file)) {
+            load_patterns_from_file(zi, zipignore_file, base_dir);
+        }
     } else {
-        // Look for .zipignore in base directory first
+        // Hierarchical loading: home -> local (later patterns can override earlier ones)
+        
+        // 1. First, load from user's home directory (global defaults)
+        char* home_dir = get_home_directory();
+        if (home_dir) {
+            snprintf(zipignore_path, PATH_MAX, "%s%c%s", home_dir, PATH_SEPARATOR, ZIPIGNORE_FILENAME);
+            if (file_exists(zipignore_path)) {
+                // Home patterns apply globally (scope is base_dir)
+                load_patterns_from_file(zi, zipignore_path, base_dir);
+            }
+            free(home_dir);
+        }
+        
+        // 2. Then, load from local base directory (can add to or override home patterns)
         snprintf(zipignore_path, PATH_MAX, "%s%c%s", base_dir, PATH_SEPARATOR, ZIPIGNORE_FILENAME);
         if (file_exists(zipignore_path)) {
-            found_zipignore = true;
-        } else {
-            // Try user's home directory
-            char* home_dir = get_home_directory();
-            if (home_dir) {
-                snprintf(zipignore_path, PATH_MAX, "%s%c%s", home_dir, PATH_SEPARATOR, ZIPIGNORE_FILENAME);
-                free(home_dir);
-                if (file_exists(zipignore_path)) {
-                    found_zipignore = true;
-                }
-            }
+            load_patterns_from_file(zi, zipignore_path, base_dir);
         }
-    }
-    
-    if (found_zipignore) {
-        // Load patterns from the main .zipignore file
-        // The scope_dir for root .zipignore is the base_dir
-        load_patterns_from_file(zi, zipignore_path, base_dir);
     }
     
     return EXIT_SUCCESS;
