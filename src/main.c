@@ -189,6 +189,19 @@ int parse_arguments(int argc, char* argv[], options_t* opts) {
             opts->target_dir = ".";
         }
     }
+    
+    // Set target directory for differential mode if not specified
+    if (opts->diff_mode && !opts->target_dir) {
+        if (opts->input_file_count > 0) {
+            opts->target_dir = opts->input_files[0];
+            // Clear input_files - diff mode uses target_dir exclusively
+            opts->input_files = NULL;
+            opts->input_file_count = 0;
+        } else {
+            opts->target_dir = ".";
+        }
+    }
+    
     return EXIT_SUCCESS;
 }
 
