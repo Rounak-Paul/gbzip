@@ -12,8 +12,8 @@ void print_usage(const char* program_name) {
     printf("Options:\n");
     printf("  -r   recurse into directories (default)     -j   junk (don't record) directory names\n");
     printf("  -0   store only (no compression)            -9   compress better\n");
-    printf("  -q   quiet operation                         -v   verbose operation\n");
-    printf("  -f   force overwrite existing files         -u   update: only changed or new files\n");
+    printf("  -q   quiet operation (no TUI)               -u   update: only changed or new files\n");
+    printf("  -f   force overwrite existing files\n");
     printf("  -s   structured output (JSON-like for UI)   -x   extract files from zipfile\n");
     printf("  -l   list files in zipfile                  -T   timestamp archive to latest\n");
     printf("  -d <dir>  extract files into directory     -m   move into zipfile (delete OS files)\n");
@@ -74,12 +74,8 @@ int parse_arguments(int argc, char* argv[], options_t* opts) {
                 case 'r':
                     opts->recursive = true;
                     break;
-                case 'v':
-                    opts->verbose = true;
-                    break;
                 case 'q':
                     opts->quiet = true;
-                    opts->verbose = false;
                     break;
                 case 's':
                     opts->structured = true;

@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "logging.h"
+#include "tui.h"
 
 #ifdef _WIN32
 #define strcasecmp _stricmp
@@ -511,12 +512,13 @@ void print_compression_progress(const progress_t* progress, int step) {
     
     double speed = (double)progress->processed_bytes / elapsed;
     const char* units = "B/s";
+    double speed_display = speed;
     
-    if (speed > 1024) {
-        speed /= 1024;
+    if (speed_display > 1024) {
+        speed_display /= 1024;
         units = "KB/s";
-        if (speed > 1024) {
-            speed /= 1024;
+        if (speed_display > 1024) {
+            speed_display /= 1024;
             units = "MB/s";
         }
     }
@@ -548,6 +550,13 @@ void print_compression_progress(const progress_t* progress, int step) {
     
     if (estimated_progress > 99.5) estimated_progress = 99.5; // Don't show 100% until done
     
+    // Update TUI if active
+    if (g_tui.is_active) {
+        tui_update_compression(estimated_progress, speed);
+        tui_refresh();
+        return;
+    }
+    
     // Use structured logging for compression progress, but maintain animation for traditional output
     if (g_log_config.structured) {
         static progress_t temp_progress = {0};
@@ -555,10 +564,10 @@ void print_compression_progress(const progress_t* progress, int step) {
         temp_progress.processed_bytes = progress->processed_bytes;
         temp_progress.total_files = progress->total_files;
         temp_progress.processed_files = progress->processed_files;
-        log_progress(&temp_progress, "compression", estimated_progress, speed, units);
+        log_progress(&temp_progress, "compression", estimated_progress, speed_display, units);
     } else {
         printf("\rCompressing and writing archive %c (%.1f%%) - %.1f %s - %lds elapsed", 
-               animation, estimated_progress, speed, units, elapsed);
+               animation, estimated_progress, speed_display, units, elapsed);
         fflush(stdout);
     }
 }

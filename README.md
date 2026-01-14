@@ -1,6 +1,14 @@
 # gbzip
 
-A ZIP utility with gitignore-style patterns and real-time progress reporting.
+A fast, multithreaded ZIP utility with gitignore-style patterns and real-time progress reporting.
+
+## Features
+
+- **Multithreaded compression**: Automatically uses all CPU cores to compress large files in parallel
+- **Smart batching**: Small files are processed efficiently without thread overhead
+- **Gitignore-style patterns**: Use `.zipignore` files to exclude files, with nested file support
+- **Real-time progress**: See detailed progress with speed reporting
+- **Cross-platform**: Works on macOS, Linux, and Windows
 
 ## Disclaimer
 
@@ -19,6 +27,7 @@ git clone https://github.com/yourusername/gbzip.git
 cd gbzip
 mkdir build && cd build
 cmake .. && make
+sudo make install
 ```
 
 Requires CMake and libzip. On macOS: `brew install libzip`. On Ubuntu/Debian: `apt install libzip-dev`.
@@ -59,24 +68,75 @@ gbzip -l archive.zip
 Create a `.zipignore` file to exclude files during archiving:
 
 ```
-build/
+# Basic patterns
+*.log
 *.tmp
-.git/
+.DS_Store
+
+# Directory patterns (trailing slash)
+build/
 node_modules/
+.git/
 venv/
+
+# Anchored patterns (leading slash - relative to .zipignore location)
+/TODO
+/config.local
+
+# Double-star patterns (match across directories)
+**/secret.key
+logs/**
+
+# Negation (include previously ignored files)
+*.log
 !important.log
+
+# Character classes
+file[0-9].txt
 ```
 
-Uses gitignore syntax. Patterns are processed during directory traversal for efficiency.
+### Nested `.zipignore` Files
+
+Like `.gitignore`, you can place `.zipignore` files at any directory depth. Patterns in each file only apply to files within that directory and its subdirectories:
+
+```
+project/
+├── .zipignore          # *.log applies to entire project
+├── src/
+│   ├── .zipignore      # *.bak applies only within src/
+│   └── main.c
+└── docs/
+    ├── .zipignore      # draft* applies only within docs/
+    └── readme.md
+```
+
+This allows fine-grained control over what gets included in different parts of your project.
 
 ## Progress Reporting
 
-For large files, use verbose mode to see real-time progress:
+gbzip automatically shows a real-time TUI with progress bars when creating archives:
 ```bash
-gbzip -v dataset.zip large_directory/
+gbzip dataset.zip large_directory/
 ```
 
-Shows file processing progress (0-2%) followed by compression progress (2-100%) with transfer speeds.
+Use `-q` to disable the TUI for quiet operation.
+
+## Multithreaded Compression
+
+gbzip automatically detects the number of CPU cores and uses parallel compression for large files:
+
+- Files larger than **1 MB** are pre-compressed in parallel using a thread pool
+- Small files are processed sequentially to avoid thread overhead
+- The number of threads scales with your CPU (capped at 16)
+
+Example output:
+```
+Using 8 threads for parallel compression of 5 large files (50.0 MB)
+Compressing large files in parallel...
+Parallel compression complete
+```
+
+This provides significant speedup for archives containing large files while maintaining fast processing for many small files.
 
 ## Advanced Features
 
@@ -118,8 +178,7 @@ Basic protections against common archive vulnerabilities:
 
 ## Options
 
-- `-v` verbose output with progress
-- `-q` quiet operation
+- `-q` quiet operation (no TUI)
 - `-s` structured JSON output
 - `-D` differential update
 - `-I <file>` custom ignore patterns

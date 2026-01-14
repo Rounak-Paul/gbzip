@@ -59,9 +59,19 @@ if(NOT LIBZIP_FOUND)
                         "  Windows: vcpkg install libzip")
 endif()
 
+# Find zlib (required for parallel compression)
+find_package(ZLIB REQUIRED)
+if(NOT ZLIB_FOUND)
+    message(FATAL_ERROR "zlib not found. Please install zlib development package:\n"
+                        "  macOS: brew install zlib (usually pre-installed)\n"
+                        "  Ubuntu/Debian: sudo apt-get install zlib1g-dev\n"
+                        "  CentOS/RHEL: sudo yum install zlib-devel")
+endif()
+
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${LIBZIP_INCLUDE_DIRS})
+include_directories(${ZLIB_INCLUDE_DIRS})
 
 # Source files
 set(SOURCES
@@ -71,6 +81,7 @@ set(SOURCES
     src/diff.c
     src/utils.c
     src/logging.c
+    src/tui.c
 )
 
 # Header files
@@ -81,13 +92,14 @@ set(HEADERS
     include/diff.h
     include/utils.h
     include/logging.h
+    include/tui.h
 )
 
 # Create executable
 add_executable(gbzip ${SOURCES} ${HEADERS})
 
 # Link libraries
-target_link_libraries(gbzip ${LIBZIP_LIBRARIES})
+target_link_libraries(gbzip ${LIBZIP_LIBRARIES} ${ZLIB_LIBRARIES})
 target_link_directories(gbzip PRIVATE ${LIBZIP_LIBRARY_DIRS})
 target_compile_options(gbzip PRIVATE ${LIBZIP_CFLAGS_OTHER})
 
@@ -95,7 +107,9 @@ target_compile_options(gbzip PRIVATE ${LIBZIP_CFLAGS_OTHER})
 if(WIN32)
     target_link_libraries(gbzip shlwapi)
 elseif(UNIX AND NOT APPLE)
-    target_link_libraries(gbzip m)
+    target_link_libraries(gbzip m pthread)
+elseif(APPLE)
+    target_link_libraries(gbzip pthread)
 endif()
 
 # Install target
