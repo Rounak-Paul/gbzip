@@ -72,8 +72,8 @@ int diff_zip(const options_t* opts) {
         }
         result = create_zip(opts);
     } else {
-        // Compare with existing ZIP
-        result = compare_with_existing_zip(opts->zip_file, opts->target_dir, &diff_ctx);
+        // Compare with existing ZIP - use resolved base_dir for consistency
+        result = compare_with_existing_zip(opts->zip_file, diff_ctx.base_dir, &diff_ctx);
         
         if (result == EXIT_SUCCESS) {
             if (diff_ctx.change_count == 0) {
@@ -247,11 +247,19 @@ int apply_changes_to_zip(const char* zip_file, const diff_context_t* diff_ctx, b
                 char file_path[PATH_MAX];
                 snprintf(file_path, PATH_MAX, "%s%c%s", diff_ctx->base_dir, PATH_SEPARATOR, change->path);
                 
-                // Convert ZIP path to system path
+                // Convert ZIP path separators to system path separators
                 for (char* p = file_path + strlen(diff_ctx->base_dir) + 1; *p; p++) {
                     if (*p == '/') {
                         *p = PATH_SEPARATOR;
                     }
+                }
+                
+                // Check if file exists before trying to add it
+                if (!file_exists(file_path)) {
+                    if (verbose) {
+                        fprintf(stderr, "Warning: File '%s' does not exist, skipping\n", file_path);
+                    }
+                    break;
                 }
                 
                 // Remove old entry if it exists (for modifications)
@@ -267,7 +275,7 @@ int apply_changes_to_zip(const char* zip_file, const diff_context_t* diff_ctx, b
                 if (!source) {
                     fprintf(stderr, "Error creating ZIP source for file '%s': %s\n", 
                             file_path, zip_strerror(archive));
-                    zip_close(archive);
+                    zip_discard(archive);
                     return EXIT_ZIP_ERROR;
                 }
                 
@@ -276,7 +284,7 @@ int apply_changes_to_zip(const char* zip_file, const diff_context_t* diff_ctx, b
                     fprintf(stderr, "Error adding file '%s' to archive: %s\n", 
                             change->path, zip_strerror(archive));
                     zip_source_free(source);
-                    zip_close(archive);
+                    zip_discard(archive);
                     return EXIT_ZIP_ERROR;
                 }
                 
