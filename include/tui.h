@@ -105,6 +105,25 @@ typedef struct {
     double compression_speed;
     bool show_compression_bar;
     
+    // Large file compression progress
+    size_t large_file_total;        // Total number of large files
+    size_t large_file_current;      // Current large file being processed
+    size_t large_file_size;         // Size of current large file
+    double large_file_percent;      // Progress within current large file
+    char large_file_name[256];      // Name of current large file
+    bool show_large_file_bar;       // Whether to show large file progress
+    
+    // Per-thread progress tracking (for multi-threaded compression)
+    #define MAX_THREAD_PROGRESS 16
+    struct {
+        char filename[64];          // File being compressed by this thread
+        size_t file_size;           // Size of file
+        double percent;             // Compression progress (0-100)
+        bool active;                // Whether thread is actively working
+    } thread_progress[MAX_THREAD_PROGRESS];
+    int active_thread_count;        // Number of threads with active work
+    size_t completed_large_files;   // Count of completed large files
+    
     // Speed tracking
     time_t start_time;
     double current_speed;       // bytes/sec
@@ -188,6 +207,17 @@ void tui_update_progress(size_t bytes_processed);
 
 // Update compression progress (0-100%)
 void tui_update_compression(double percent, double speed);
+
+// Update large file progress (current file being compressed)
+void tui_update_large_file_progress(size_t current, size_t total, const char* filename, 
+                                     size_t file_size, double percent);
+
+// Update per-thread compression progress
+void tui_update_thread_progress(int thread_id, const char* filename, size_t file_size, 
+                                 double percent, bool active);
+
+// Set completed large file count
+void tui_set_large_file_counts(size_t completed, size_t total);
 
 // Update phase
 void tui_set_phase(int phase, const char* phase_name);

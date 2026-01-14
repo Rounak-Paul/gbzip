@@ -843,6 +843,55 @@ void tui_update_compression(double percent, double speed) {
     g_tui.show_compression_bar = true;
 }
 
+void tui_update_large_file_progress(size_t current, size_t total, const char* filename,
+                                     size_t file_size, double percent) {
+    g_tui.large_file_current = current;
+    g_tui.large_file_total = total;
+    g_tui.large_file_size = file_size;
+    g_tui.large_file_percent = percent;
+    g_tui.show_large_file_bar = true;
+    
+    if (filename) {
+        // Get just the filename, not the full path
+        const char* name = strrchr(filename, '/');
+        if (!name) name = strrchr(filename, '\\');
+        if (name) name++;
+        else name = filename;
+        
+        strncpy(g_tui.large_file_name, name, sizeof(g_tui.large_file_name) - 1);
+        g_tui.large_file_name[sizeof(g_tui.large_file_name) - 1] = '\0';
+    }
+}
+
+void tui_update_thread_progress(int thread_id, const char* filename, size_t file_size,
+                                 double percent, bool active) {
+    if (thread_id < 0 || thread_id >= MAX_THREAD_PROGRESS) return;
+    
+    g_tui.thread_progress[thread_id].active = active;
+    g_tui.thread_progress[thread_id].file_size = file_size;
+    g_tui.thread_progress[thread_id].percent = percent;
+    
+    if (filename) {
+        strncpy(g_tui.thread_progress[thread_id].filename, filename, 
+                sizeof(g_tui.thread_progress[thread_id].filename) - 1);
+        g_tui.thread_progress[thread_id].filename[sizeof(g_tui.thread_progress[thread_id].filename) - 1] = '\0';
+    } else {
+        g_tui.thread_progress[thread_id].filename[0] = '\0';
+    }
+    
+    // Count active threads
+    int active_count = 0;
+    for (int i = 0; i < MAX_THREAD_PROGRESS; i++) {
+        if (g_tui.thread_progress[i].active) active_count++;
+    }
+    g_tui.active_thread_count = active_count;
+}
+
+void tui_set_large_file_counts(size_t completed, size_t total) {
+    g_tui.completed_large_files = completed;
+    g_tui.large_file_total = total;
+}
+
 void tui_set_phase(int phase, const char* phase_name) {
     // If transitioning from phase 1 (scanning), show final count and move to new line
     if (g_tui.current_phase == 1 && phase != 1) {
@@ -899,18 +948,75 @@ void tui_refresh(void) {
         return;
     }
     
-    // Phase 2: Parallel pre-compression
+    // Phase 2: Parallel pre-compression - show per-thread progress bars
     if (g_tui.current_phase == 2) {
-        static int compress_spinner = 0;
-        const char* frames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
-        printf("\r" TUI_CLEAR_LINE);
-        tui_print_color(TUI_CYAN, "  %s ", frames[compress_spinner++ % 10]);
-        tui_print_color(TUI_WHITE, "Pre-compressing large files");
-        if (g_tui.sys_stats.num_threads > 0) {
-            tui_print_color(TUI_DIM, " (");
-            tui_print_color(TUI_CYAN, "%d threads", g_tui.sys_stats.num_threads);
-            tui_print_color(TUI_DIM, ")");
+        static int last_line_count = 0;
+        
+        // Move cursor up to overwrite previous output
+        if (last_line_count > 0) {
+            printf("\033[%dA", last_line_count);
         }
+        
+        int lines_printed = 0;
+        
+        // Header line with overall progress
+        printf("\r" TUI_CLEAR_LINE);
+        tui_print_color(TUI_CYAN, "  ⚡ ");
+        tui_print_color(TUI_WHITE, "Compressing large files ");
+        tui_print_color(TUI_BRIGHT_YELLOW, "[%zu/%zu]", 
+                        g_tui.completed_large_files, g_tui.large_file_total);
+        tui_print_color(TUI_DIM, " using ");
+        tui_print_color(TUI_CYAN, "%d", g_tui.sys_stats.num_threads);
+        tui_print_color(TUI_DIM, " threads\n");
+        lines_printed++;
+        
+        // Show progress bar for each active thread
+        int threads_shown = 0;
+        for (int i = 0; i < MAX_THREAD_PROGRESS && threads_shown < g_tui.sys_stats.num_threads; i++) {
+            printf(TUI_CLEAR_LINE);
+            
+            if (g_tui.thread_progress[i].active && g_tui.thread_progress[i].filename[0]) {
+                // Thread is working on a file
+                tui_print_color(TUI_DIM, "    T%d ", i + 1);
+                
+                // Truncate filename
+                char display_name[20];
+                if (strlen(g_tui.thread_progress[i].filename) > 16) {
+                    snprintf(display_name, sizeof(display_name), "...%s",
+                             g_tui.thread_progress[i].filename + strlen(g_tui.thread_progress[i].filename) - 13);
+                } else {
+                    strncpy(display_name, g_tui.thread_progress[i].filename, sizeof(display_name) - 1);
+                    display_name[sizeof(display_name) - 1] = '\0';
+                }
+                tui_print_color(TUI_WHITE, "%-16s ", display_name);
+                
+                // Progress bar
+                int bar_width = 20;
+                double pct = g_tui.thread_progress[i].percent;
+                int filled = (int)(bar_width * pct / 100.0);
+                int empty = bar_width - filled;
+                
+                tui_print_color(TUI_DIM, "[");
+                tui_print_color(TUI_GREEN, "");
+                for (int j = 0; j < filled; j++) printf("█");
+                tui_print_color(TUI_DIM, "");
+                for (int j = 0; j < empty; j++) printf("░");
+                tui_print_color(TUI_DIM, "] ");
+                
+                // Size
+                tui_print_color(TUI_CYAN, "%s", tui_format_bytes(g_tui.thread_progress[i].file_size));
+                threads_shown++;
+            } else {
+                // Thread is idle
+                tui_print_color(TUI_DIM, "    T%d ", i + 1);
+                tui_print_color(TUI_DIM, "(idle)");
+                threads_shown++;
+            }
+            printf("\n");
+            lines_printed++;
+        }
+        
+        last_line_count = lines_printed;
         fflush(stdout);
         return;
     }

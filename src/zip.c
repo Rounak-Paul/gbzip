@@ -10,6 +10,11 @@
     #include <pthread.h>
     #include <unistd.h>
     #include <sys/sysctl.h>
+    #ifdef __APPLE__
+        #include <mach/mach.h>
+    #else
+        #include <sys/sysinfo.h>
+    #endif
 #else
     #include <windows.h>
 #endif
@@ -21,6 +26,45 @@
 // Threshold for using parallel compression (files larger than this get pre-compressed)
 #define PARALLEL_COMPRESSION_THRESHOLD (1 * 1024 * 1024)  // 1MB
 #define SMALL_FILE_BATCH_SIZE 100  // Process small files in batches
+
+// Memory management constants
+#define MIN_AVAILABLE_MEMORY_MB 512          // Keep at least 512MB free
+#define MAX_CONCURRENT_BYTES (512ULL * 1024 * 1024)  // Max 512MB in-flight for compression
+#define MEMORY_CHECK_INTERVAL 5              // Check memory every N files
+
+// (unused - using g_tui.large_file_* fields instead)
+
+// Get available system memory in bytes
+static size_t get_available_memory(void) {
+#ifdef __APPLE__
+    mach_port_t host_port = mach_host_self();
+    vm_size_t page_size;
+    host_page_size(host_port, &page_size);
+    
+    vm_statistics64_data_t vm_stat;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    
+    if (host_statistics64(host_port, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) == KERN_SUCCESS) {
+        // Free + inactive pages can be reclaimed
+        return ((uint64_t)vm_stat.free_count + (uint64_t)vm_stat.inactive_count) * page_size;
+    }
+    return 2ULL * 1024 * 1024 * 1024; // Default 2GB if query fails
+#elif defined(_WIN32)
+    MEMORYSTATUSEX memInfo;
+    memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+    if (GlobalMemoryStatusEx(&memInfo)) {
+        return (size_t)memInfo.ullAvailPhys;
+    }
+    return 2ULL * 1024 * 1024 * 1024;
+#else
+    // Linux
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        return (size_t)(si.freeram + si.bufferram) * si.mem_unit;
+    }
+    return 2ULL * 1024 * 1024 * 1024;
+#endif
+}
 
 // File entry for the work queue
 typedef struct file_entry {
@@ -38,6 +82,48 @@ typedef struct file_entry {
     
     struct file_entry* next;
 } file_entry_t;
+
+// Calculate safe batch size based on available memory
+static size_t calculate_safe_batch_size(file_entry_t* large_files[], size_t large_file_count, size_t* batch_memory) {
+    size_t available = get_available_memory();
+    size_t reserve = MIN_AVAILABLE_MEMORY_MB * 1024 * 1024;
+    
+    if (available <= reserve) {
+        // Very low memory - process one file at a time
+        *batch_memory = large_files[0] ? (size_t)large_files[0]->size * 3 : 0; // Estimate 3x for compression buffers
+        return 1;
+    }
+    
+    size_t usable = available - reserve;
+    if (usable > MAX_CONCURRENT_BYTES) {
+        usable = MAX_CONCURRENT_BYTES;
+    }
+    
+    // Calculate how many files we can process
+    size_t batch_size = 0;
+    size_t memory_needed = 0;
+    
+    for (size_t i = 0; i < large_file_count && batch_size < large_file_count; i++) {
+        // Estimate memory: file size + compressed buffer (~same size) + overhead
+        size_t file_memory = (size_t)large_files[i]->size * 3;  // Conservative 3x estimate
+        
+        if (memory_needed + file_memory > usable) {
+            break;
+        }
+        
+        memory_needed += file_memory;
+        batch_size++;
+    }
+    
+    // Always process at least one file
+    if (batch_size == 0) {
+        batch_size = 1;
+        memory_needed = large_files[0] ? (size_t)large_files[0]->size * 3 : 0;
+    }
+    
+    *batch_memory = memory_needed;
+    return batch_size;
+}
 
 // Thread-safe work queue
 typedef struct {
@@ -57,8 +143,15 @@ typedef struct {
 typedef struct compression_work {
     file_entry_t* entry;
     int compression_level;
+    int thread_id;              // Which thread is processing this
     struct compression_work* next;
 } compression_work_t;
+
+// Thread worker context (passed to each thread)
+typedef struct {
+    void* pool;                 // Pointer to thread_pool_t
+    int thread_id;              // This thread's ID (0-based)
+} thread_worker_ctx_t;
 
 // Thread pool for parallel compression
 typedef struct {
@@ -80,6 +173,7 @@ typedef struct {
     HANDLE* threads;
 #endif
     int num_threads;
+    thread_worker_ctx_t* worker_contexts;  // Per-thread context
 } thread_pool_t;
 
 // Get number of CPU cores
@@ -221,10 +315,15 @@ static int compress_file_data(const char* file_path, unsigned char** out_data,
 // Worker thread function for parallel compression
 #ifndef _WIN32
 static void* compression_worker(void* arg) {
-    thread_pool_t* pool = (thread_pool_t*)arg;
+    thread_worker_ctx_t* ctx = (thread_worker_ctx_t*)arg;
+    thread_pool_t* pool = (thread_pool_t*)ctx->pool;
+    int thread_id = ctx->thread_id;
     
     while (1) {
         pthread_mutex_lock(&pool->mutex);
+        
+        // Mark thread as idle
+        tui_update_thread_progress(thread_id, NULL, 0, 0, false);
         
         // Wait for work
         while (!pool->work_head && !pool->shutdown) {
@@ -252,10 +351,21 @@ static void* compression_worker(void* arg) {
             // Perform compression
             file_entry_t* entry = work->entry;
             
+            // Update TUI with this thread's current file
+            const char* display_name = strrchr(entry->file_path, '/');
+            if (!display_name) display_name = strrchr(entry->file_path, '\\');
+            if (display_name) display_name++;
+            else display_name = entry->file_path;
+            
+            tui_update_thread_progress(thread_id, display_name, entry->size, 0.0, true);
+            
             int result = compress_file_data(entry->file_path, 
                                            &entry->compressed_data,
                                            &entry->compressed_size,
                                            work->compression_level);
+            
+            // Mark as complete (100%)
+            tui_update_thread_progress(thread_id, display_name, entry->size, 100.0, true);
             
             entry->compression_failed = (result != 0);
             entry->compression_done = true;
@@ -270,14 +380,22 @@ static void* compression_worker(void* arg) {
         }
     }
     
+    // Mark thread as inactive on exit
+    tui_update_thread_progress(thread_id, NULL, 0, 0, false);
+    
     return NULL;
 }
 #else
 static DWORD WINAPI compression_worker(LPVOID arg) {
-    thread_pool_t* pool = (thread_pool_t*)arg;
+    thread_worker_ctx_t* ctx = (thread_worker_ctx_t*)arg;
+    thread_pool_t* pool = (thread_pool_t*)ctx->pool;
+    int thread_id = ctx->thread_id;
     
     while (1) {
         EnterCriticalSection(&pool->cs);
+        
+        // Mark thread as idle
+        tui_update_thread_progress(thread_id, NULL, 0, 0, false);
         
         while (!pool->work_head && !pool->shutdown) {
             LeaveCriticalSection(&pool->cs);
@@ -304,10 +422,21 @@ static DWORD WINAPI compression_worker(LPVOID arg) {
         if (work) {
             file_entry_t* entry = work->entry;
             
+            // Update TUI with this thread's current file
+            const char* display_name = strrchr(entry->file_path, '/');
+            if (!display_name) display_name = strrchr(entry->file_path, '\\');
+            if (display_name) display_name++;
+            else display_name = entry->file_path;
+            
+            tui_update_thread_progress(thread_id, display_name, entry->size, 0.0, true);
+            
             int result = compress_file_data(entry->file_path,
                                            &entry->compressed_data,
                                            &entry->compressed_size,
                                            work->compression_level);
+            
+            // Mark as complete (100%)
+            tui_update_thread_progress(thread_id, display_name, entry->size, 100.0, true);
             
             entry->compression_failed = (result != 0);
             entry->compression_done = true;
@@ -320,6 +449,9 @@ static DWORD WINAPI compression_worker(LPVOID arg) {
             free(work);
         }
     }
+    
+    // Mark thread as inactive on exit
+    tui_update_thread_progress(thread_id, NULL, 0, 0, false);
     
     return 0;
 }
@@ -336,6 +468,18 @@ static thread_pool_t* pool_create(int num_threads) {
     // Need at least 1 thread
     if (pool->num_threads < 1) pool->num_threads = 1;
     
+    // Allocate per-thread contexts
+    pool->worker_contexts = calloc(pool->num_threads, sizeof(thread_worker_ctx_t));
+    if (!pool->worker_contexts) {
+        free(pool);
+        return NULL;
+    }
+    
+    for (int i = 0; i < pool->num_threads; i++) {
+        pool->worker_contexts[i].pool = pool;
+        pool->worker_contexts[i].thread_id = i;
+    }
+    
 #ifndef _WIN32
     pthread_mutex_init(&pool->mutex, NULL);
     pthread_cond_init(&pool->work_available, NULL);
@@ -343,7 +487,7 @@ static thread_pool_t* pool_create(int num_threads) {
     
     pool->threads = malloc(sizeof(pthread_t) * pool->num_threads);
     for (int i = 0; i < pool->num_threads; i++) {
-        pthread_create(&pool->threads[i], NULL, compression_worker, pool);
+        pthread_create(&pool->threads[i], NULL, compression_worker, &pool->worker_contexts[i]);
     }
 #else
     InitializeCriticalSection(&pool->cs);
@@ -352,7 +496,7 @@ static thread_pool_t* pool_create(int num_threads) {
     
     pool->threads = malloc(sizeof(HANDLE) * pool->num_threads);
     for (int i = 0; i < pool->num_threads; i++) {
-        pool->threads[i] = CreateThread(NULL, 0, compression_worker, pool, 0, NULL);
+        pool->threads[i] = CreateThread(NULL, 0, compression_worker, &pool->worker_contexts[i], 0, NULL);
     }
 #endif
     
@@ -461,6 +605,7 @@ static void pool_destroy(thread_pool_t* pool) {
 #endif
     
     free(pool->threads);
+    free(pool->worker_contexts);
     free(pool);
 }
 
@@ -681,7 +826,7 @@ int create_zip(const options_t* opts) {
     size_t large_file_count = 0;
     size_t large_file_bytes = 0;
     
-    // Count large files
+    // Count large files and build array for batch processing
     for (file_entry_t* e = file_queue.head; e; e = e->next) {
         if (!e->is_directory && e->size >= PARALLEL_COMPRESSION_THRESHOLD) {
             large_file_count++;
@@ -695,43 +840,141 @@ int create_zip(const options_t* opts) {
     
     if (large_file_count > 0 && large_file_bytes > 5 * 1024 * 1024) {
         int num_cores = get_num_cores();
-        pool = pool_create(num_cores);
+        
+        // Build array of large file pointers for batching
+        file_entry_t** large_files = malloc(sizeof(file_entry_t*) * large_file_count);
+        if (!large_files) {
+            fprintf(stderr, "Error: Out of memory allocating file list\n");
+            queue_free(&file_queue);
+            if (use_tui) tui_cleanup();
+            return EXIT_ZIP_ERROR;
+        }
+        
+        size_t lf_idx = 0;
+        for (file_entry_t* e = file_queue.head; e && lf_idx < large_file_count; e = e->next) {
+            if (!e->is_directory && e->size >= PARALLEL_COMPRESSION_THRESHOLD) {
+                large_files[lf_idx++] = e;
+            }
+        }
+        
+        // Sort by size descending for better memory utilization (process biggest first)
+        for (size_t i = 0; i < large_file_count - 1; i++) {
+            for (size_t j = i + 1; j < large_file_count; j++) {
+                if (large_files[j]->size > large_files[i]->size) {
+                    file_entry_t* tmp = large_files[i];
+                    large_files[i] = large_files[j];
+                    large_files[j] = tmp;
+                }
+            }
+        }
         
         if (use_tui) {
-            g_tui.sys_stats.num_threads = pool->num_threads;
-            g_tui.sys_stats.active_threads = pool->num_threads;
+            g_tui.sys_stats.num_threads = num_cores;
+            g_tui.sys_stats.active_threads = num_cores;
+            tui_set_large_file_counts(0, large_file_count);
         }
         
-        if (pool && ctx.verbose && !use_tui) {
+        if (ctx.verbose && !use_tui) {
             printf("Using %d threads for parallel compression of %zu large files (%.1f MB)\n",
-                   pool->num_threads, large_file_count, large_file_bytes / (1024.0 * 1024.0));
+                   num_cores, large_file_count, large_file_bytes / (1024.0 * 1024.0));
+            size_t avail_mem = get_available_memory();
+            printf("Available memory: %.1f MB (reserving %d MB)\n", 
+                   avail_mem / (1024.0 * 1024.0), MIN_AVAILABLE_MEMORY_MB);
         }
         
-        // Queue large files for parallel compression
-        for (file_entry_t* e = file_queue.head; e; e = e->next) {
-            if (!e->is_directory && e->size >= PARALLEL_COMPRESSION_THRESHOLD) {
+        // Process large files in memory-safe batches
+        size_t processed_large = 0;
+        
+        while (processed_large < large_file_count) {
+            // Calculate safe batch size based on current available memory
+            size_t batch_memory = 0;
+            size_t remaining = large_file_count - processed_large;
+            size_t batch_size = calculate_safe_batch_size(large_files + processed_large, remaining, &batch_memory);
+            
+            // Create thread pool for this batch (recreate to reset counters)
+            pool = pool_create(num_cores);
+            if (!pool) {
+                fprintf(stderr, "Error: Could not create thread pool\n");
+                free(large_files);
+                queue_free(&file_queue);
+                if (use_tui) tui_cleanup();
+                return EXIT_ZIP_ERROR;
+            }
+            
+            if (ctx.verbose && !use_tui) {
+                printf("Batch: processing %zu files (estimated %.1f MB memory)\n", 
+                       batch_size, batch_memory / (1024.0 * 1024.0));
+            }
+            
+            // Queue files for this batch
+            for (size_t i = 0; i < batch_size; i++) {
+                file_entry_t* e = large_files[processed_large + i];
                 pool_add_work(pool, e, compression_level);
             }
-        }
-        
-        // Wait for all compression to complete with TUI updates
-        if (ctx.verbose && !use_tui) {
-            printf("Compressing large files in parallel...\n");
-        }
-        
-        if (use_tui) {
-            // Poll with TUI updates while waiting
-            while (!pool_is_done(pool, large_file_count)) {
-                tui_refresh();
-                #ifndef _WIN32
-                    usleep(100000); // 100ms
-                #else
-                    Sleep(100);
-                #endif
+            
+            // Wait for batch to complete with TUI updates
+            if (use_tui) {
+                while (!pool_is_done(pool, batch_size)) {
+                    // Get current completion count for progress
+                    #ifndef _WIN32
+                        pthread_mutex_lock(&pool->mutex);
+                        size_t current_completed = pool->completed_count;
+                        pthread_mutex_unlock(&pool->mutex);
+                    #else
+                        EnterCriticalSection(&pool->cs);
+                        size_t current_completed = pool->completed_count;
+                        LeaveCriticalSection(&pool->cs);
+                    #endif
+                    
+                    // Update completed count for overall progress
+                    tui_set_large_file_counts(processed_large + current_completed, large_file_count);
+                    
+                    tui_refresh();
+                    #ifndef _WIN32
+                        usleep(100000); // 100ms
+                    #else
+                        Sleep(100);
+                    #endif
+                }
+            } else {
+                pool_wait(pool, batch_size);
             }
-        } else {
-            pool_wait(pool, large_file_count);
+            
+            // Destroy pool for this batch (frees thread resources)
+            pool_destroy(pool);
+            pool = NULL;
+            
+            // Free compressed data for files that failed (fall back to normal compression)
+            for (size_t i = 0; i < batch_size; i++) {
+                file_entry_t* e = large_files[processed_large + i];
+                if (e->compression_failed && e->compressed_data) {
+                    free(e->compressed_data);
+                    e->compressed_data = NULL;
+                    e->compressed_size = 0;
+                }
+            }
+            
+            processed_large += batch_size;
+            
+            // Check memory pressure before next batch
+            if (processed_large < large_file_count) {
+                size_t avail = get_available_memory();
+                if (avail < MIN_AVAILABLE_MEMORY_MB * 1024 * 1024) {
+                    // Memory is tight - wait a bit for GC/cleanup
+                    if (ctx.verbose && !use_tui) {
+                        printf("Low memory (%.1f MB available), waiting for cleanup...\n",
+                               avail / (1024.0 * 1024.0));
+                    }
+                    #ifndef _WIN32
+                        usleep(500000); // 500ms
+                    #else
+                        Sleep(500);
+                    #endif
+                }
+            }
         }
+        
+        free(large_files);
         
         if (ctx.verbose && !use_tui) {
             printf("Parallel compression complete\n");
