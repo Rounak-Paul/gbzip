@@ -9,8 +9,8 @@
 #ifndef _WIN32
     #include <pthread.h>
     #include <unistd.h>
-    #include <sys/sysctl.h>
     #ifdef __APPLE__
+        #include <sys/sysctl.h>
         #include <mach/mach.h>
     #else
         #include <sys/sysinfo.h>
