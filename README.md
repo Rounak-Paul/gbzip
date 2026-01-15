@@ -23,7 +23,7 @@ A fast, multithreaded ZIP utility with gitignore-style patterns and real-time pr
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/gbzip.git
+git clone https://github.com/yourusername/gbzip.git -- oops! AI mistake, do this: https://github.com/Rounak-Paul/gbzip.git
 cd gbzip
 mkdir build && cd build
 cmake .. && make
